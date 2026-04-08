@@ -1,0 +1,24 @@
+name: rf_hourglass
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - accelerate==1.11.0
+    - einops==0.8.1
+    - matplotlib==3.10.7
+    - medpy==0.5.2
+    - monai==1.5.1
+    - nibabel==5.3.2
+    - numpy==1.26.4
+    - pillow==12.0.0
+    - scipy==1.15.3
+    - synapseclient==4.11.0
+    - torch==2.9.0
+    - torchvision==0.24.0
+    - tqdm==4.67.1
+    - wandb==0.23.1
+    # neighborhood attention acceleration.
+    # Install manually after environment creation:
+    # pip install natten==0.21.5+torch290cu128 -f https://whl.natten.org

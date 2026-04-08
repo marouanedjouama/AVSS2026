@@ -1,0 +1,15 @@
+data/
+checkpoints/
+logs/
+wandb/
+states/
+metrics/
+
+*.pt
+*.pth
+
+__pycache__/
+*.pyc
+
+.env/
+venv/
