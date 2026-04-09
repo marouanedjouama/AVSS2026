@@ -333,7 +333,7 @@ def main():
                    help='the mixed precision type')
     p.add_argument('--name', type=str, default='model',
                    help='the name of the run')
-    p.add_argument('--num-workers', type=int, default=8,
+    p.add_argument('--num-workers', type=int, default=16,
                    help='the number of data loader workers')
     p.add_argument('--resume', type=str,
                    help='the checkpoint to resume from')
@@ -527,16 +527,19 @@ def main():
         end_step = args.end_step or train_config['max_steps']
         max_epochs = math.ceil(end_step / len(train_dl))
 
+    sched_total_steps = max(1, math.ceil(end_step / args.grad_accum_steps))
+
     # LR scheduler
-    warmup_steps = int(end_step * sched_config['warmup'])
+    warmup_steps = int(sched_total_steps * sched_config['warmup'])
     if sched_config['type'] == 'constant':
         sched = ConstantLRWithWarmup(opt, warmup_steps=warmup_steps)
     elif sched_config['type'] == 'cosine':
         sched = LinearWarmupCosineAnnealingLR(
             opt,
             warmup_epochs=warmup_steps,
-            max_epochs=end_step,
-            warmup_start_lr=lr / 10,
+            max_epochs=sched_total_steps,
+            warmup_start_lr=1e-6,
+            eta_min=1e-6,
         )
     else:
         raise ValueError(f'Invalid schedule type: {sched_config["type"]}')
