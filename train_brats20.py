@@ -37,7 +37,6 @@ from tqdm.auto import tqdm
 from torch.utils.data import RandomSampler, WeightedRandomSampler
 
 from dataloaders.bratsDataset_v2 import BraTSDataset2D
-from dataloaders.bratsDataset21 import BraTSDataset21
 
 from ema import ExponentialMovingAverage
 
@@ -255,7 +254,7 @@ def compute_slice_weights(case_paths, slice_range=(0, 154), nonzero_weight=10.0,
 class EarlyStopping:
     """Early stops the training if validation metric doesn't improve after a given patience."""
 
-    def __init__(self, patience=10, verbose=True, delta=0.0, save_path='checkpoints/best.pth'):
+    def __init__(self, patience=10, verbose=True, delta=0.0, save_path='checkpoints_2020/best.pth'):
         """
         Args:
             patience: How many validation steps to wait after last improvement.
@@ -321,7 +320,7 @@ def main():
                    help='the maximum number of epochs to train for (overrides config)')
     p.add_argument('--evaluate-every', type=int, default=None,
                    help='evaluate every this many steps (overrides config)')
-    p.add_argument('--evaluate-n', type=int, default=2000,
+    p.add_argument('--evaluate-n', type=int, default=None,
                    help='the number of samples to draw to evaluate')
     p.add_argument('--evaluate-only', action='store_true',
                    help='evaluate instead of training')
@@ -337,7 +336,7 @@ def main():
                    help='the number of data loader workers')
     p.add_argument('--resume', type=str,
                    help='the checkpoint to resume from')
-    p.add_argument('--sample-n', type=int, default=64,
+    p.add_argument('--sample-n', type=int, default=8,
                    help='the number of images to sample for demo grids')
     p.add_argument('--sample-steps', type=int, default=100,
                    help='the number of Euler steps for sampling')
@@ -362,7 +361,6 @@ def main():
                    help='early stopping patience (number of evaluations without improvement)')
     p.add_argument('--delta', type=float, default=0.005,
                    help='minimum improvement in validation metric to reset patience')
-    p.add_argument('--brats', type=str, default='2021',)
     args = p.parse_args()
 
     mp.set_start_method(args.start_method)
@@ -460,21 +458,14 @@ def main():
     print(f'Train cases: {len(case_dirs_train)}, Val cases: {len(case_dirs_val)}')
 
 
-    if args.brats == '2020':
-        dataset_class = BraTSDataset2D
-    elif args.brats == '2021':
-        dataset_class = BraTSDataset21
-    else: 
-        raise ValueError(f"Invalid BraTS version specified: {args.brats}. Must be '2020' or '2021'.")
-
-    train_dataset = dataset_class(
+    train_dataset = BraTSDataset2D(
         case_paths=case_dirs_train,
         train=True,
         slice_range=dataset_config['slice_range'],
         target_size=dataset_config['image_size'],
     )
 
-    val_dataset = dataset_class(
+    val_dataset = BraTSDataset2D(
         case_paths=case_dirs_val,
         train=False,
         slice_range=dataset_config['slice_range'],
@@ -527,16 +518,19 @@ def main():
         end_step = args.end_step or train_config['max_steps']
         max_epochs = math.ceil(end_step / len(train_dl))
 
+    sched_total_steps = max(1, math.ceil(end_step / args.grad_accum_steps))
+
     # LR scheduler
-    warmup_steps = int(end_step * sched_config['warmup'])
+    warmup_steps = int(sched_total_steps * sched_config['warmup'])
     if sched_config['type'] == 'constant':
         sched = ConstantLRWithWarmup(opt, warmup_steps=warmup_steps)
     elif sched_config['type'] == 'cosine':
         sched = LinearWarmupCosineAnnealingLR(
             opt,
             warmup_epochs=warmup_steps,
-            max_epochs=end_step,
-            warmup_start_lr=lr / 10,
+            max_epochs=sched_total_steps,
+            warmup_start_lr=1e-6,
+            eta_min=1e-6,
         )
     else:
         raise ValueError(f'Invalid schedule type: {sched_config["type"]}')
@@ -618,7 +612,7 @@ def main():
     image_key = "image"
 
     # Checkpoint state
-    state_path = Path(f'states/{args.name}_state.json')
+    state_path = Path(f'states_2020/{args.name}_state.json')
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
     if state_path.exists() or args.resume:
@@ -655,9 +649,9 @@ def main():
     evaluate_enabled = eval_every > 0 and args.evaluate_n > 0
     metrics_log = None
     if evaluate_enabled and accelerator.is_main_process:
-        Path('metrics').mkdir(exist_ok=True)
+        Path('metrics_2020').mkdir(exist_ok=True)
         metrics_log = CSVLogger(
-            f'metrics/{args.name}_metrics.csv',
+            f'metrics_2020/{args.name}_metrics.csv',
             ['step', 'time', 'loss', 'mean_dice'] + [f'dice_{name}' for name in seg_class_names],
         )
 
@@ -715,8 +709,8 @@ def main():
         if accelerator.is_main_process:
             tqdm.write('Running segmentation demo...')
 
-        Path('demos').mkdir(exist_ok=True)
-        filename = f'demos/{args.name}_demo_{split}_{step:08}.png'
+        Path('demos_2020').mkdir(exist_ok=True)
+        filename = f'demos_2020/{args.name}_demo_{split}_{step:08}.png'
 
         if split == 'train':
             demo_batch = next(iter(train_dl))
@@ -824,7 +818,7 @@ def main():
             if n_cases is not None and len(case_dice_scores) >= n_cases:
                 break
 
-            case_dataset = dataset_class(
+            case_dataset = BraTSDataset2D(
                 case_paths=[case_path],
                 train=False,
                 slice_range=slice_range,
@@ -956,9 +950,9 @@ def main():
     def save(save_path=None):
         """Save checkpoint."""
         accelerator.wait_for_everyone()
-        Path('checkpoints').mkdir(exist_ok=True)
+        Path('checkpoints_2020').mkdir(exist_ok=True)
         if save_path is None:
-            filename = f'checkpoints/{args.name}_{step:08}.pth'
+            filename = f'checkpoints_2020/{args.name}_{step:08}.pth'
         else:
             filename = save_path
         if accelerator.is_main_process:
@@ -993,7 +987,7 @@ def main():
             patience=args.patience,
             verbose=accelerator.is_main_process,
             delta=args.delta,
-            save_path=f'checkpoints/{args.name}_best.pth',
+            save_path=f'checkpoints_2020/{args.name}_best.pth',
         )
         if accelerator.is_main_process:
             print(f'Early stopping enabled: patience={args.patience}, delta={args.delta}')
