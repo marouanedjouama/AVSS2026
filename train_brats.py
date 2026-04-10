@@ -561,6 +561,7 @@ def main():
 
 
     inner_model, opt, train_dl, val_dl, sched = accelerator.prepare(inner_model, opt, train_dl, val_dl, sched)
+    print(f'== Model device after prepare: {next(inner_model.parameters()).device} ==', flush=True)
 
     # EMA (must be after accelerator.prepare so shadow params are on the correct device)
     ema = ExponentialMovingAverage(unwrap(inner_model).parameters(), decay=ema_config['decay'])
