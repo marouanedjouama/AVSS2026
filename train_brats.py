@@ -403,6 +403,16 @@ def main():
         print(f'World size: {accelerator.num_processes}', flush=True)
         print(f'Batch size: {args.batch_size * accelerator.num_processes}', flush=True)
 
+    
+    if not torch.cuda.is_available() or device.type != 'cuda':
+        if accelerator.is_main_process:
+            print('No CUDA GPU detected. Exiting before training.', flush=True)
+        accelerator.wait_for_everyone()
+        raise SystemExit(1)
+
+    else:
+        print(f'CUDA GPU detected: {torch.cuda.get_device_name(device)})', flush=True)
+
     if args.seed is not None:
         seeds = torch.randint(-2 ** 63, 2 ** 63 - 1, [accelerator.num_processes],
                               generator=torch.Generator().manual_seed(args.seed))
