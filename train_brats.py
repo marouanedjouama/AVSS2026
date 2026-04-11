@@ -500,17 +500,17 @@ def main():
         print(f'Number of items in val_dataset: {len(val_dataset):,}')
 
 
-    # weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
+    weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
     
-    # sampler = WeightedRandomSampler(
-    #     weights=weights,
-    #     num_samples=len(weights),   # one full epoch worth of draws
-    #     replacement=True,           # required for weighted sampling
-    #     generator=sampler_gen,
-    # )
+    sampler = WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),   # one full epoch worth of draws
+        replacement=True,           # required for weighted sampling
+        generator=sampler_gen,
+    )
 
     train_dl = data.DataLoader(
-        train_dataset, args.batch_size, shuffle=True,
+        train_dataset, args.batch_size, sampler=sampler, prefetch_factor=4,
         num_workers=args.num_workers, persistent_workers=True, pin_memory=True, generator=dl_gen, worker_init_fn=worker_init_fn
     )
 
@@ -520,7 +520,6 @@ def main():
         num_workers=args.num_workers, persistent_workers=True, pin_memory=True,
         sampler=val_sampler, generator=dl_gen, worker_init_fn=worker_init_fn
     )
-
 
     # Resolve overrides
     save_every = args.save_every or train_config['save_every']
@@ -536,16 +535,19 @@ def main():
         end_step = args.end_step or train_config['max_steps']
         max_epochs = math.ceil(end_step / len(train_dl))
 
+    sched_total_steps = max(1, math.ceil(end_step / args.grad_accum_steps))
+
     # LR scheduler
-    warmup_steps = int(end_step * sched_config['warmup'])
+    warmup_steps = int(sched_total_steps * sched_config['warmup'])
     if sched_config['type'] == 'constant':
         sched = ConstantLRWithWarmup(opt, warmup_steps=warmup_steps)
     elif sched_config['type'] == 'cosine':
         sched = LinearWarmupCosineAnnealingLR(
             opt,
             warmup_epochs=warmup_steps,
-            max_epochs=end_step,
+            max_epochs=sched_total_steps,
             warmup_start_lr=lr / 10,
+            eta_min=1e-6,
         )
     else:
         raise ValueError(f'Invalid schedule type: {sched_config["type"]}')

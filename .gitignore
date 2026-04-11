@@ -1,5 +1,4 @@
 data/
-checkpoints/
 logs/
 wandb/
 states/
