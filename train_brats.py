@@ -500,17 +500,17 @@ def main():
         print(f'Number of items in val_dataset: {len(val_dataset):,}')
 
 
-    weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
+    # weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
     
-    sampler = WeightedRandomSampler(
-        weights=weights,
-        num_samples=len(weights),   # one full epoch worth of draws
-        replacement=True,           # required for weighted sampling
-        generator=sampler_gen,
-    )
+    # sampler = WeightedRandomSampler(
+    #     weights=weights,
+    #     num_samples=len(weights),   # one full epoch worth of draws
+    #     replacement=True,           # required for weighted sampling
+    #     generator=sampler_gen,
+    # )
 
     train_dl = data.DataLoader(
-        train_dataset, args.batch_size, sampler=sampler, prefetch_factor=4,
+        train_dataset, args.batch_size, shuffle=True, prefetch_factor=4,
         num_workers=args.num_workers, persistent_workers=True, pin_memory=True, generator=dl_gen, worker_init_fn=worker_init_fn
     )
 
@@ -662,6 +662,13 @@ def main():
     else:
         epoch = 0
         step = 0
+
+
+    # log model device and opt device
+    if accelerator.is_main_process:
+        model_device = next(inner_model.parameters()).device
+        opt_device = opt.param_groups[0]['params'][0].device
+        print(f'Model device: {model_device}, Optimizer device: {opt_device}', flush=True)
 
     # Metrics logging
     evaluate_enabled = eval_every > 0 and args.evaluate_n > 0
