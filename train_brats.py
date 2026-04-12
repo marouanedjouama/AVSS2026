@@ -512,17 +512,20 @@ def main():
         print(f'Number of items in test_dataset: {len(test_dataset):,}')
 
 
-    # weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
+    if not args.evaluate_only:
+        weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),   # one full epoch worth of draws
+            replacement=True,           # required for weighted sampling
+            generator=sampler_gen,
+        )
     
-    # sampler = WeightedRandomSampler(
-    #     weights=weights,
-    #     num_samples=len(weights),   # one full epoch worth of draws
-    #     replacement=True,           # required for weighted sampling
-    #     generator=sampler_gen,
-    # )
+    else: 
+        sampler = None
 
     train_dl = data.DataLoader(
-        train_dataset, args.batch_size, shuffle=True, prefetch_factor=4,
+        train_dataset, args.batch_size, sampler=sampler, prefetch_factor=8,
         num_workers=args.num_workers, persistent_workers=True, pin_memory=True, generator=dl_gen, worker_init_fn=worker_init_fn
     )
 
@@ -531,13 +534,6 @@ def main():
         val_dataset, args.batch_size, shuffle=False,
         num_workers=args.num_workers, persistent_workers=True, pin_memory=True,
         sampler=val_sampler, generator=dl_gen, worker_init_fn=worker_init_fn
-    )
-
-    test_dl = data.DataLoader(
-        test_dataset, args.batch_size, shuffle=False,
-        num_workers=args.num_workers, persistent_workers=True, pin_memory=True,
-        sampler=RandomSampler(test_dataset, replacement=False, generator=sampler_gen),
-        generator=dl_gen, worker_init_fn=worker_init_fn
     )
 
     # Resolve overrides
@@ -690,7 +686,7 @@ def main():
         print(f'Model device: {model_device}, Optimizer device: {opt_device}', flush=True)
 
     # Metrics logging
-    evaluate_enabled = eval_every > 0 and args.evaluate_n > 0
+    evaluate_enabled = eval_every > 0 or (args.evaluate_n is not None and args.evaluate_n > 0)
     metrics_log = None
     if evaluate_enabled and accelerator.is_main_process:
         Path('metrics').mkdir(exist_ok=True)
@@ -859,6 +855,10 @@ def main():
         case_dice_scores = []
         case_hd_scores = []
 
+        model_to_use = unwrap(inner_model)
+        ema.store(model_to_use.parameters())
+        ema.copy_to(model_to_use.parameters())
+
         for case_path in tqdm(case_dirs, desc='Volume-level test eval'):
 
             if n_cases is not None and len(case_dice_scores) >= n_cases:
@@ -889,11 +889,11 @@ def main():
                 gt_seg_case = case_batch['label'].cpu()
 
                 if n_ensample <= 1:
-                    pred_seg_case = sample_segmentation(cond_img_case)
+                    pred_seg_case = sample_segmentation(cond_img_case, use_ema=False)
                 else:
                     pred_ens = []
                     for _ in range(n_ensample):
-                        pred_ens.append(sample_segmentation(cond_img_case))
+                        pred_ens.append(sample_segmentation(cond_img_case, use_ema=False))
                     pred_seg_case = torch.stack(pred_ens).mean(dim=0)
                 
                 pred_seg_binary_case = threshold_predictions(pred_seg_case).cpu()
@@ -915,6 +915,8 @@ def main():
 
             case_dice_scores.append(case_dice)
             case_hd_scores.append(case_hd)
+
+        ema.restore(model_to_use.parameters())
 
         case_dice_scores = np.asarray(case_dice_scores, dtype=np.float32)
         case_hd_scores = np.asarray(case_hd_scores, dtype=np.float32)
