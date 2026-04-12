@@ -363,6 +363,8 @@ def main():
     p.add_argument('--delta', type=float, default=0.005,
                    help='minimum improvement in validation metric to reset patience')
     p.add_argument('--brats', type=str, default='2021',)
+    p.add_argument('--eval-split', type=str, default='val', choices=['val', 'test'],)
+
     args = p.parse_args()
 
     mp.set_start_method(args.start_method)
@@ -466,8 +468,10 @@ def main():
 
     case_dirs_train = case_dirs[:int(len(case_dirs) * train_split)]
     case_dirs_val = case_dirs[int(len(case_dirs) * train_split):int(len(case_dirs) * (train_split + val_split))]
+    case_dirs_test = case_dirs[int(len(case_dirs) * (train_split + val_split)):]
 
-    print(f'Train cases: {len(case_dirs_train)}, Val cases: {len(case_dirs_val)}')
+
+    print(f'Train cases: {len(case_dirs_train)}, Val cases: {len(case_dirs_val)}, Test cases: {len(case_dirs_test)}')
 
 
     if args.brats == '2020':
@@ -491,6 +495,13 @@ def main():
         target_size=dataset_config['image_size'],
     )
 
+    test_dataset = dataset_class(
+        case_paths=case_dirs_test,
+        train=False,
+        slice_range=dataset_config['slice_range'],
+        target_size=dataset_config['image_size'],
+    )
+
     train_transforms_logged = serialize_transforms(getattr(train_dataset, 'transform', None))
     test_transforms_logged = serialize_transforms(getattr(val_dataset, 'transform', None))
 
@@ -498,6 +509,7 @@ def main():
     if accelerator.is_main_process:
         print(f'Number of items in train_dataset: {len(train_dataset):,}')
         print(f'Number of items in val_dataset: {len(val_dataset):,}')
+        print(f'Number of items in test_dataset: {len(test_dataset):,}')
 
 
     # weights = compute_slice_weights(case_dirs_train, slice_range=dataset_config['slice_range'], nonzero_weight=5.0, empty_weight=1.0)
@@ -519,6 +531,13 @@ def main():
         val_dataset, args.batch_size, shuffle=False,
         num_workers=args.num_workers, persistent_workers=True, pin_memory=True,
         sampler=val_sampler, generator=dl_gen, worker_init_fn=worker_init_fn
+    )
+
+    test_dl = data.DataLoader(
+        test_dataset, args.batch_size, shuffle=False,
+        num_workers=args.num_workers, persistent_workers=True, pin_memory=True,
+        sampler=RandomSampler(test_dataset, replacement=False, generator=sampler_gen),
+        generator=dl_gen, worker_init_fn=worker_init_fn
     )
 
     # Resolve overrides
@@ -823,15 +842,17 @@ def main():
         if not accelerator.is_main_process:
             return None
 
-        case_dirs = case_dirs_val if split == 'val' else case_dirs_train
+        case_dirs = case_dirs_val if split == 'val' else case_dirs_test if split == 'test' else case_dirs_train
 
         if len(case_dirs) == 0:
             tqdm.write('No test cases found for volume-level evaluation.')
             return None
+        
+        print(f'Running volume-level evaluation on {split} split with {len(case_dirs)} cases...')
 
         target_cases = len(case_dirs) if n_cases is None else min(n_cases, len(case_dirs))
         tqdm.write(
-            f'Evaluating volume-level metrics on {target_cases} test cases '
+            f'Evaluating volume-level metrics on {target_cases} {split} cases '
             f'using slices [{slice_range[0]}, {slice_range[1]}]...'
         )
 
@@ -853,7 +874,7 @@ def main():
             case_dl = data.DataLoader(
                 case_dataset,
                 args.batch_size,
-                shuffle=True,
+                shuffle=False,
                 num_workers=args.num_workers,
                 persistent_workers=args.num_workers > 0,
                 pin_memory=True,
@@ -1002,7 +1023,7 @@ def main():
 
     # --- Evaluate only mode ---
     if args.evaluate_only:
-        evaluate(split='val', n_ensample=args.n_ensample, slice_range=dataset_config['slice_range'], n_cases=args.evaluate_n)
+        evaluate(split=args.eval_split, n_ensample=args.n_ensample, slice_range=dataset_config['slice_range'], n_cases=args.evaluate_n)
         return
 
     # --- Early stopping setup ---
