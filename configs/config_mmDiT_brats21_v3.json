@@ -31,7 +31,7 @@
         "rk45_rtol": 1e-5
     },
     "dataset": {
-        "data_path": "~/MM-HDiT/data/brats2021/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData/",
+        "data_path": "data/brats2021/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData/",
         "splits": {"train": 0.7, "val": 0.1, "test": 0.2},
         "slice_range": [30, 130],
         "image_size": [192, 192]

@@ -330,7 +330,7 @@ def main():
                    help='the maximum number of epochs to train for (overrides config)')
     p.add_argument('--evaluate-every', type=int, default=None,
                    help='evaluate every this many steps (overrides config)')
-    p.add_argument('--evaluate-n', type=int, default=2000,
+    p.add_argument('--evaluate-n', type=int, default=15,
                    help='the number of samples to draw to evaluate')
     p.add_argument('--evaluate-only', action='store_true',
                    help='evaluate instead of training')
