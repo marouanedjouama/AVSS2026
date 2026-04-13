@@ -43,25 +43,35 @@ class BraTSDataset21(Dataset):
                 monai_transforms.SpatialPadd(keys =["image", "label"], spatial_size=self.target_size, mode="constant"),
                 monai_transforms.CenterSpatialCropd(keys=["image", "label"], roi_size=self.target_size),
 
-                monai_transforms.RandRotated(
-                    keys=["image", "label"],
-                    range_x=0.26,   # ±15 degrees in radians
-                    prob=0.5,
-                    mode=("bilinear", "nearest"),
-                    padding_mode="zeros",
-                    keep_size=True
-                ),
+                # monai_transforms.RandRotated(
+                #     keys=["image", "label"],
+                #     range_x=0.26,   # ±15 degrees in radians
+                #     prob=0.5,
+                #     mode=("bilinear", "nearest"),
+                #     padding_mode="zeros",
+                #     keep_size=True
+                # ),
                 
                 monai_transforms.RandFlipd(keys =["image", "label"], prob=0.5, spatial_axis=0),
                 monai_transforms.RandFlipd(keys =["image", "label"], prob=0.5, spatial_axis=1),
 
-                monai_transforms.RandZoomd(
+                # monai_transforms.RandZoomd(
+                #     keys=["image", "label"],
+                #     prob=0.3,
+                #     min_zoom=0.9,
+                #     max_zoom=1.1,
+                #     mode=("bilinear", "nearest"),
+                #     keep_size=True
+                # ),
+
+                monai_transforms.RandAffined(
                     keys=["image", "label"],
-                    prob=0.3,
-                    min_zoom=0.9,
-                    max_zoom=1.1,
+                    prob=0.5,
+                    rotate_range=(0.26,),   # ~15degrees
+                    scale_range=(0.1,),
+                    translate_range=(10, 10),
                     mode=("bilinear", "nearest"),
-                    keep_size=True
+                    padding_mode="zeros",
                 ),
 
                 monai_transforms.NormalizeIntensityd(keys =["image"], nonzero=True, channel_wise=True),

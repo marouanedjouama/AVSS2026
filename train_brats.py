@@ -55,6 +55,7 @@ from lr_scheduler import ConstantLRWithWarmup, LinearWarmupCosineAnnealingLR
 from utils.metric import dice, hausdorff_distance_95
 from rectified_flow import RectifiedFlow
 from sampling import euler_sample, rk45_sample
+from hourglass.image_transformer_v3 import ImageTransformerDenoiserModelV3
 
 
 CLASS_DICE_THRESH = [0.5, 0.5, 0.5]
@@ -185,13 +186,21 @@ def make_model(config):
         d_ff=model_config.get('mapping_d_ff', widths[0] * 3),
         dropout=model_config.get('mapping_dropout', 0.0),
     )
-    model = ImageTransformerDenoiserModelV2(
+
+    model_type = model_config.get('type', 'image_transformer_v2')
+    model_kwargs = dict(
         levels=levels,
         mapping=mapping,
         in_channels=model_config['input_channels'],
         out_channels=model_config['output_channels'],
         patch_size=tuple(model_config['patch_size']),
     )
+    if model_type == 'image_transformer_v2':
+        model = ImageTransformerDenoiserModelV2(**model_kwargs)
+    elif model_type == 'image_transformer_v3':
+        model = ImageTransformerDenoiserModelV3(**model_kwargs)
+    else:
+        raise ValueError(f"Unsupported model.type: {model_type}")
 
     return model
 
@@ -255,7 +264,7 @@ def compute_slice_weights(case_paths, slice_range=(0, 154), nonzero_weight=10.0,
 class EarlyStopping:
     """Early stops the training if validation metric doesn't improve after a given patience."""
 
-    def __init__(self, patience=10, verbose=True, delta=0.0, save_path='checkpoints/best.pth'):
+    def __init__(self, patience=10, verbose=True, delta=0.0, save_path='best.pth'):
         """
         Args:
             patience: How many validation steps to wait after last improvement.
@@ -337,9 +346,9 @@ def main():
                    help='the number of data loader workers')
     p.add_argument('--resume', type=str,
                    help='the checkpoint to resume from')
-    p.add_argument('--sample-n', type=int, default=64,
+    p.add_argument('--sample-n', type=int, default=8,
                    help='the number of images to sample for demo grids')
-    p.add_argument('--sample-steps', type=int, default=100,
+    p.add_argument('--sample-steps', type=int, default=1,
                    help='the number of Euler steps for sampling')
     p.add_argument('--save-every', type=int, default=None,
                    help='save every this many steps (overrides config)')
@@ -386,6 +395,15 @@ def main():
     sched_config = config['lr_sched']
     ema_config = config['ema']
     train_config = config['training']
+
+    model_type = str(model_config.get('type', 'image_transformer_v2'))
+    output_suffix = '_v3' if model_type.endswith('_v3') else ''
+    output_dirs = {
+        'states': Path(f'states{output_suffix}'),
+        'checkpoints': Path(f'checkpoints{output_suffix}'),
+        'metrics': Path(f'metrics{output_suffix}'),
+        'demos': Path(f'demos{output_suffix}'),
+    }
 
     assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
@@ -645,7 +663,7 @@ def main():
     image_key = "image"
 
     # Checkpoint state
-    state_path = Path(f'states/{args.name}_state.json')
+    state_path = output_dirs['states'] / f'{args.name}_state.json'
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
     if state_path.exists() or args.resume:
@@ -689,9 +707,9 @@ def main():
     evaluate_enabled = eval_every > 0 or (args.evaluate_n is not None and args.evaluate_n > 0)
     metrics_log = None
     if evaluate_enabled and accelerator.is_main_process:
-        Path('metrics').mkdir(exist_ok=True)
+        output_dirs['metrics'].mkdir(exist_ok=True)
         metrics_log = CSVLogger(
-            f'metrics/{args.name}_metrics.csv',
+            str(output_dirs['metrics'] / f'{args.name}_metrics.csv'),
             ['step', 'time', 'loss', 'mean_dice'] + [f'dice_{name}' for name in seg_class_names],
         )
 
@@ -749,8 +767,8 @@ def main():
         if accelerator.is_main_process:
             tqdm.write('Running segmentation demo...')
 
-        Path('demos').mkdir(exist_ok=True)
-        filename = f'demos/{args.name}_demo_{split}_{step:08}.png'
+        output_dirs['demos'].mkdir(exist_ok=True)
+        filename = output_dirs['demos'] / f'{args.name}_demo_{split}_{step:08}.png'
 
         if split == 'train':
             demo_batch = next(iter(train_dl))
@@ -825,7 +843,7 @@ def main():
 
             if use_wandb:
                 import wandb
-                wandb.log({'demo_grid': wandb.Image(filename), 'demo_mean_dice': mean_dice}, step=step)
+                wandb.log({'demo_grid': wandb.Image(str(filename)), 'demo_mean_dice': mean_dice}, step=step)
 
     @torch.no_grad()
     def evaluate(slice_range=(30, 135), n_ensample=1, n_cases=None, split='val'):
@@ -998,11 +1016,11 @@ def main():
     def save(save_path=None):
         """Save checkpoint."""
         accelerator.wait_for_everyone()
-        Path('checkpoints').mkdir(exist_ok=True)
+        output_dirs['checkpoints'].mkdir(exist_ok=True)
         if save_path is None:
-            filename = f'checkpoints/{args.name}_{step:08}.pth'
+            filename = output_dirs['checkpoints'] / f'{args.name}_{step:08}.pth'
         else:
-            filename = save_path
+            filename = Path(save_path)
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
         obj = {
@@ -1018,9 +1036,9 @@ def main():
             'dl_gen': dl_gen.get_state(),
             'elapsed': elapsed,
         }
-        accelerator.save(obj, filename)
+        accelerator.save(obj, str(filename))
         if accelerator.is_main_process:
-            state_obj = {'latest_checkpoint': filename}
+            state_obj = {'latest_checkpoint': str(filename)}
             json.dump(state_obj, open(state_path, 'w'))
 
     # --- Evaluate only mode ---
@@ -1035,7 +1053,7 @@ def main():
             patience=args.patience,
             verbose=accelerator.is_main_process,
             delta=args.delta,
-            save_path=f'checkpoints/{args.name}_best.pth',
+            save_path=str(output_dirs['checkpoints'] / f'{args.name}_best.pth'),
         )
         if accelerator.is_main_process:
             print(f'Early stopping enabled: patience={args.patience}, delta={args.delta}')
