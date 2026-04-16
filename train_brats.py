@@ -330,7 +330,7 @@ def main():
                    help='the maximum number of epochs to train for (overrides config)')
     p.add_argument('--evaluate-every', type=int, default=None,
                    help='evaluate every this many steps (overrides config)')
-    p.add_argument('--evaluate-n', type=int, default=15,
+    p.add_argument('--evaluate-n', type=int, default=20,
                    help='the number of samples to draw to evaluate')
     p.add_argument('--evaluate-only', action='store_true',
                    help='evaluate instead of training')
@@ -369,7 +369,7 @@ def main():
                    help='enable early stopping based on validation dice')
     p.add_argument('--patience', type=int, default=10,
                    help='early stopping patience (number of evaluations without improvement)')
-    p.add_argument('--delta', type=float, default=0.005,
+    p.add_argument('--delta', type=float, default=0.001,
                    help='minimum improvement in validation metric to reset patience')
     p.add_argument('--brats', type=str, default='2021',)
     p.add_argument('--eval-split', type=str, default='val', choices=['val', 'test'],)
@@ -1146,7 +1146,7 @@ def main():
                             return
 
                 # Save based on steps only if early stopping is disabled
-                if not args.use_early_stopping and step > 0 and step % save_every == 0:
+                if step > 0 and step % save_every == 0:
                     save()
 
                 if step >= end_step:

@@ -1,1 +1,1 @@
-python train_brats.py --config configs/config_mmDiT_brats21_v3.json --name Run_3 --batch-size 32 --max-epochs 300 --wandb-project AVSS-brats2021 --sample-steps 1 --evaluate-every 50000 --save-every 25000 --evaluate-n 25 --use-early-stopping --compile --mixed-precision bf16 --num-workers 32
+python train_brats.py --config configs/config_mmDiT_brats20.json --name Run_2 --batch-size 32 --max-epochs 300 --wandb-project AVSS-brats2020 --sample-steps 1 --evaluate-every 20000 --save-every 10000 --evaluate-n 25 --use-early-stopping --compile --mixed-precision bf16 --num-workers 32
