@@ -1,21 +1,31 @@
 # !/usr/bin/env python3
 
-"""Main training and evaluation script for ACDC 2D segmentation
+"""Main training and evaluation script for ACDC segmentation
 using Hourglass Transformer + Rectified Flow.
 """
+
+# python train_brats.py --config configs/config_mmDiT_brats20.json --brats 2020 --name Run_1 --batch-size 16 --grad-accum-steps 2 --max-epochs 300 --wandb-project AVSS2026-brats2020 
+# --sample-steps 5 --evaluate-n 5 --evaluate-every 1000 --demo-every 1000 --save-every 5000 --compile --checkpointing
+
+# TODO when resuming training, it start from the beginning of the dataloader and drops the rest of the current epoch. 
+# It would be better to save the dataloader state and resume from the exact same point.
+
+# TODO remove your wandb key later
+
 
 import argparse
 from contextlib import contextmanager
 from datetime import datetime
 import json
 import math
+import os
 from pathlib import Path
 import time
 import random
 import numpy as np
+import re
 
 import accelerate
-from numpy import mean
 import torch
 import torch._dynamo
 from torch import distributed as dist
@@ -26,26 +36,29 @@ from torchvision import utils as tv_utils
 from tqdm.auto import tqdm
 from torch.utils.data import RandomSampler
 
-from dataloaders.loader_ACDC import ACDCPreprocessed, get_train_augmentations, get_val_augmentations
 from ema import ExponentialMovingAverage
 
-from hourglass.MM_HDiT import (
-    DualStreamHourglassTransformer,
-    LevelSpec as DualStreamLevelSpec,
-    MappingSpec as DualStreamMappingSpec,
-    GlobalAttentionSpec as DualStreamGlobalAttentionSpec,
-    CrossNeighborhoodAttentionSpec as DualStreamNeighborhoodAttentionSpec,
+from hourglass.image_transformer_v2 import (
+    ImageTransformerDenoiserModelV2,
+    LevelSpec,
+    MappingSpec,
+    GlobalAttentionSpec,
+    NeighborhoodAttentionSpec,
 )
-
+from hourglass.image_transformer_v3 import ImageTransformerDenoiserModelV3
+from hourglass.image_transformer_v3_noLerp import ImageTransformerDenoiserModelV3_noLerp
+                                                
 from hourglass.flags import checkpointing as checkpointing_ctx
 from hourglass import flops as model_flops
 from lr_scheduler import ConstantLRWithWarmup, LinearWarmupCosineAnnealingLR
 from utils.metric import dice, hausdorff_distance_95
-from avss2026.rectified_flow import RectifiedFlow
-from sampling import euler_sample, rk45_sample
+from rectified_flow import RectifiedFlow
+from sampling import euler_sample
+from dataloaders.loader_ACDC import ACDCPreprocessed, get_train_augmentations, get_val_augmentations
 
 
-CLASS_DICE_THRESH = [0.5, 0.5, 0.5]
+# CLASS_DICE_THRESH = [0.5, 0.5, 0.5]
+CLASS_DICE_THRESH = [0.5050, 0.411, 0.5016] # better than [0.5] * 3
 
 
 def worker_init_fn(worker_id):
@@ -63,6 +76,34 @@ def ensure_distributed():
 def n_params(module):
     """Returns the number of trainable parameters in a module."""
     return sum(p.numel() for p in module.parameters())
+
+
+def serialize_transforms(transform_pipeline):
+    """Convert a transform pipeline to a JSON-serializable list of dictionaries."""
+    if transform_pipeline is None:
+        return []
+
+    transforms_list = getattr(transform_pipeline, 'transforms', [transform_pipeline])
+    serialized = []
+    for transform in transforms_list:
+        t_info = {'type': transform.__class__.__name__}
+        try:
+            args = {}
+            for k, v in vars(transform).items():
+                if not k.startswith('_'):
+                    if isinstance(v, (int, float, str, bool, type(None))):
+                        args[k] = v
+                    elif isinstance(v, (list, tuple)):
+                        args[k] = [str(item) if not isinstance(item, (int, float, str, bool, type(None))) else item for item in v]
+                    elif isinstance(v, dict):
+                        args[k] = {str(dk): (str(dv) if not isinstance(dv, (int, float, str, bool, type(None))) else dv) for dk, dv in v.items()}
+                    else:
+                        args[k] = str(v)
+            t_info['args'] = args
+        except Exception:
+            pass
+        serialized.append(t_info)
+    return serialized
 
 
 @contextmanager
@@ -116,50 +157,56 @@ def make_model(config):
     if self_attns_config:
         for sa in self_attns_config:
             attn_type = sa['type']
-            # Dual stream attention types
             if attn_type in ('global', 'global_dualstream'):
-                self_attns.append(DualStreamGlobalAttentionSpec(
+                self_attns.append(GlobalAttentionSpec(
                     d_head=sa['d_head'],
-                    # n_kv_heads=sa.get('n_kv_heads', None)  # None = MHA, int = GQA
                 ))
             elif attn_type in ('neighborhood', 'neighborhood_dualstream'):
-                self_attns.append(DualStreamNeighborhoodAttentionSpec(
+                self_attns.append(NeighborhoodAttentionSpec(
                     d_head=sa['d_head'],
                     kernel_size=sa['kernel_size'],
-                    # n_kv_heads=sa.get('n_kv_heads', None)  # None = MHA, int = GQA
                 ))
             else:
-                raise ValueError(f"Unknown attention type for dual stream model: {attn_type}")
+                raise ValueError(f"Unknown attention type: {attn_type}")
     else:
-        # Default: neighborhood for all but last, global for last
         raise ValueError("self_attns configuration is required in the config for this code.")
 
     levels = []
     for i in range(len(depths)):
-        levels.append(DualStreamLevelSpec(
+        levels.append(LevelSpec(
             depth=depths[i],
             width=widths[i],
             d_ff=d_ffs[i],
             self_attn=self_attns[i],
             dropout=dropout_rate[i],
         ))
-    mapping = DualStreamMappingSpec(
+    mapping = MappingSpec(
         depth=model_config.get('mapping_depth', 2),
         width=model_config.get('mapping_width', widths[0]),
         d_ff=model_config.get('mapping_d_ff', widths[0] * 3),
-        dropout=model_config.get('mapping_dropout', 0.0), # TODO - original paper used 0.1
+        dropout=model_config.get('mapping_dropout', 0.0),
     )
-    # For dual stream: seg channels = output_channels, img channels = input_channels - output_channels
-    in_channels_seg = model_config['output_channels']
-    in_channels_img = model_config['input_channels'] - model_config['output_channels']
-    model = DualStreamHourglassTransformer(
+    model_type = model_config.get('type', 'image_transformer_v2')
+    model_type_norm = model_type.lower()
+    model_kwargs = dict(
         levels=levels,
         mapping=mapping,
-        in_channels_seg=in_channels_seg,
-        in_channels_img=in_channels_img,
+        in_channels=model_config['input_channels'],
         out_channels=model_config['output_channels'],
         patch_size=tuple(model_config['patch_size']),
     )
+    if model_type_norm == 'image_transformer_v2':
+        model = ImageTransformerDenoiserModelV2(**model_kwargs)
+    elif model_type_norm == 'image_transformer_v3':
+        model = ImageTransformerDenoiserModelV3(**model_kwargs)
+    elif model_type_norm in (
+        'image_transformer_v3_nolerp',
+        'image_transformer_v3_no_lerp',
+        'imagetransformerdenoisermodelv3_nolerp',
+    ):
+        model = ImageTransformerDenoiserModelV3_noLerp(**model_kwargs)
+    else:
+        raise ValueError(f"Unsupported model.type: {model_type}")
 
     return model
 
@@ -189,6 +236,54 @@ def priority_overlay(one_hot, class_colors, priority_order):
     return rgb
 
 
+class EarlyStopping:
+    """Early stops the training if validation metric doesn't improve after a given patience."""
+
+    def __init__(self, patience=10, verbose=True, delta=0.0, save_path='checkpoints_acdc/best.pth'):
+        """
+        Args:
+            patience: How many validation steps to wait after last improvement.
+            verbose: Print messages.
+            delta: Minimum improvement to qualify as an improvement.
+            save_path: Where to save the best model.
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.delta = delta
+        self.save_path = save_path
+        self.best_score = None
+        self.counter = 0
+        self.early_stop = False
+
+    def __call__(self, val_metric, save_fn):
+        """
+        Args:
+            val_metric: Current validation metric (higher is better).
+            save_fn: Callable to save the checkpoint.
+        """
+        score = val_metric
+
+        if self.best_score is None:
+            self.best_score = score
+            save_fn(self.save_path)
+            if self.verbose:
+                print(f"Validation metric: {score:.4f}. Saving best model to {self.save_path}")
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter}/{self.patience} (best: {self.best_score:.4f})")
+            if self.counter >= self.patience:
+                if self.verbose:
+                    print("Early stopping triggered!")
+                self.early_stop = True
+        else:
+            if self.verbose:
+                print(f"Validation metric improved: {self.best_score:.4f} -> {score:.4f}. Saving best model.")
+            self.best_score = score
+            save_fn(self.save_path)
+            self.counter = 0
+
+
 def convert_to_onehot(label, num_classes=4):
     """Convert class indices to one-hot encoding, excluding background (class 0).
 
@@ -205,6 +300,84 @@ def convert_to_onehot(label, num_classes=4):
     for c in range(1, num_classes):  # Skip background (0)
         onehot[:, c - 1] = (label[:, 0] == c).float()
     return onehot
+
+
+def parse_volume_and_slice(npz_name):
+    """Parse ACDC preprocessed filename into volume id and slice index.
+
+    Expected pattern examples:
+      patient001_ED_slice03.npz
+      patient001_ES_slice12.npz
+    """
+    stem = Path(npz_name).stem
+    match = re.match(r'^(?P<volume_id>.+)_slice(?P<slice_idx>\d+)$', stem)
+    if match is None:
+        return None
+    return match.group('volume_id'), int(match.group('slice_idx'))
+
+
+def build_volume_index(split_dir):
+    """Build mapping: volume_id -> sorted list[(slice_idx, npz_path)]."""
+    volume_index = {}
+    for fname in sorted(os.listdir(split_dir)):
+        if not fname.endswith('.npz'):
+            continue
+        parsed = parse_volume_and_slice(fname)
+        if parsed is None:
+            continue
+        volume_id, slice_idx = parsed
+        volume_index.setdefault(volume_id, []).append((slice_idx, os.path.join(split_dir, fname)))
+
+    for volume_id in volume_index:
+        volume_index[volume_id].sort(key=lambda x: x[0])
+
+    return volume_index
+
+
+def get_tta_transforms(mode='flip'):
+    """Return forward/inverse transforms for test-time augmentation."""
+    if mode == 'none':
+        return [
+            (lambda x: x, lambda y: y, 'identity'),
+        ]
+
+    if mode == 'flip':
+        return [
+            (lambda x: x, lambda y: y, 'identity'),
+            (lambda x: torch.flip(x, dims=(-1,)), lambda y: torch.flip(y, dims=(-1,)), 'hflip'),
+            (lambda x: torch.flip(x, dims=(-2,)), lambda y: torch.flip(y, dims=(-2,)), 'vflip'),
+            (lambda x: torch.flip(x, dims=(-2, -1)), lambda y: torch.flip(y, dims=(-2, -1)), 'hvflip'),
+        ]
+
+    if mode == 'd4':
+        return [
+            (lambda x: x, lambda y: y, 'rot0'),
+            (lambda x: torch.rot90(x, 1, dims=(-2, -1)), lambda y: torch.rot90(y, -1, dims=(-2, -1)), 'rot90'),
+            (lambda x: torch.rot90(x, 2, dims=(-2, -1)), lambda y: torch.rot90(y, -2, dims=(-2, -1)), 'rot180'),
+            (lambda x: torch.rot90(x, 3, dims=(-2, -1)), lambda y: torch.rot90(y, -3, dims=(-2, -1)), 'rot270'),
+            (
+                lambda x: torch.flip(x, dims=(-1,)),
+                lambda y: torch.flip(y, dims=(-1,)),
+                'hflip',
+            ),
+            (
+                lambda x: torch.rot90(torch.flip(x, dims=(-1,)), 1, dims=(-2, -1)),
+                lambda y: torch.flip(torch.rot90(y, -1, dims=(-2, -1)), dims=(-1,)),
+                'hflip_rot90',
+            ),
+            (
+                lambda x: torch.rot90(torch.flip(x, dims=(-1,)), 2, dims=(-2, -1)),
+                lambda y: torch.flip(torch.rot90(y, -2, dims=(-2, -1)), dims=(-1,)),
+                'hflip_rot180',
+            ),
+            (
+                lambda x: torch.rot90(torch.flip(x, dims=(-1,)), 3, dims=(-2, -1)),
+                lambda y: torch.flip(torch.rot90(y, -3, dims=(-2, -1)), dims=(-1,)),
+                'hflip_rot270',
+            ),
+        ]
+
+    raise ValueError(f'Unknown TTA mode: {mode}')
 
 
 def main():
@@ -224,9 +397,11 @@ def main():
                    help='save a demo grid every this many steps (overrides config)')
     p.add_argument('--end-step', type=int, default=None,
                    help='the step to end training at (overrides config)')
+    p.add_argument('--max-epochs', type=int, default=None,
+                   help='the maximum number of epochs to train for (overrides config)')
     p.add_argument('--evaluate-every', type=int, default=None,
                    help='evaluate every this many steps (overrides config)')
-    p.add_argument('--evaluate-n', type=int, default=2000,
+    p.add_argument('--evaluate-n', type=int, default=None,
                    help='the number of samples to draw to evaluate')
     p.add_argument('--evaluate-only', action='store_true',
                    help='evaluate instead of training')
@@ -238,14 +413,18 @@ def main():
                    help='the mixed precision type')
     p.add_argument('--name', type=str, default='model',
                    help='the name of the run')
-    p.add_argument('--num-workers', type=int, default=8,
+    p.add_argument('--num-workers', type=int, default=16,
                    help='the number of data loader workers')
     p.add_argument('--resume', type=str,
                    help='the checkpoint to resume from')
-    p.add_argument('--sample-n', type=int, default=64,
+    p.add_argument('--sample-n', type=int, default=8,
                    help='the number of images to sample for demo grids')
-    p.add_argument('--sample-steps', type=int, default=100,
+    p.add_argument('--sample-steps', type=int, default=1,
                    help='the number of Euler steps for sampling')
+    p.add_argument('--tta', action='store_true',
+                   help='enable test-time augmentation for demo/evaluation sampling')
+    p.add_argument('--tta-mode', type=str, default='flip', choices=['none', 'flip', 'd4'],
+                   help='the TTA transform set to use when --tta is enabled')
     p.add_argument('--save-every', type=int, default=None,
                    help='save every this many steps (overrides config)')
     p.add_argument('--seed', type=int, default=42,
@@ -261,14 +440,28 @@ def main():
                    help='the wandb group name')
     p.add_argument('--wandb-project', type=str,
                    help='the wandb project name (specify this to enable wandb)')
+    p.add_argument('--use-early-stopping', action='store_true',
+                   help='enable early stopping based on validation dice')
+    p.add_argument('--patience', type=int, default=10,
+                   help='early stopping patience (number of evaluations without improvement)')
+    p.add_argument('--delta', type=float, default=0.005,
+                   help='minimum improvement in validation metric to reset patience')
+    p.add_argument('--eval-split', type=str, default='val', choices=['train', 'val', 'test'],)
+
+    # find best thresholds only mode (for validation and test splits separately)
+    p.add_argument('--find-best-thresh', action='store_true',
+                   help='only find best thresholds for evaluation (no training)')
+    p.add_argument('--thresh-start', type=float, default=0.1,
+                   help='the start of the threshold range to search for best thresholds')
+    p.add_argument('--thresh-end', type=float, default=0.9,
+                   help='the end of the threshold range to search for best thresholds')
     args = p.parse_args()
 
     mp.set_start_method(args.start_method)
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # CUDA determinism
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
     try:
         torch._dynamo.config.automatic_dynamic_shapes = False
     except AttributeError:
@@ -278,21 +471,16 @@ def main():
     config = load_config(args.config)
     model_config = config['model']
     flow_config = config['flow']
-    sampling_config = config['sampling']
     dataset_config = config['dataset']
     opt_config = config['optimizer']
     sched_config = config['lr_sched']
     ema_config = config['ema']
     train_config = config['training']
+    num_classes = dataset_config.get('num_classes', 4)
 
     assert len(model_config['input_size']) == 2 and model_config['input_size'][0] == model_config['input_size'][1]
     size = model_config['input_size']
 
-    # Resolve overrides
-    end_step = args.end_step or train_config['max_steps']
-    save_every = args.save_every or train_config['save_every']
-    eval_every = args.evaluate_every or train_config['eval_every']
-    demo_every = args.demo_every or train_config.get('demo_every', eval_every)
 
     # Accelerator
     accelerator = accelerate.Accelerator(
@@ -319,7 +507,9 @@ def main():
         from monai.utils import set_determinism
         set_determinism(seed=args.seed)
 
-    demo_gen = torch.Generator().manual_seed(seeds[accelerator.process_index].item())
+
+    sampler_gen = torch.Generator().manual_seed(seeds[accelerator.process_index].item())
+    dl_gen = torch.Generator().manual_seed(seeds[accelerator.process_index].item() + 1)
     elapsed = 0.0
 
     # Build model
@@ -340,23 +530,103 @@ def main():
                           lr=lr,
                           betas=tuple(opt_config['betas']),
                           eps=opt_config['eps'],
-                          weight_decay=opt_config['weight_decay'])
+                          weight_decay=opt_config['weight_decay'],
+                          fused=True)
     else:
         raise ValueError(f'Invalid optimizer type: {opt_config["type"]}')
 
+
+    train_split_dir = dataset_config['train_path']
+    val_split_dir = dataset_config.get('val_path', dataset_config.get('test_path'))
+    test_split_dir = dataset_config.get('test_path', .0)
+
+    if val_split_dir is None:
+        raise ValueError('dataset.val_path or dataset.test_path must be set in config.')
+
+    volume_index_by_split = {
+        'train': build_volume_index(train_split_dir),
+        'val': build_volume_index(val_split_dir),
+        'test': build_volume_index(test_split_dir),
+    }
+
+    if accelerator.is_main_process:
+        print(
+            f"Volumes - train: {len(volume_index_by_split['train'])}, "
+            f"val: {len(volume_index_by_split['val'])}, test: {len(volume_index_by_split['test'])}"
+        )
+
+    # Dataset
+    train_dataset = ACDCPreprocessed(
+        data_dir=train_split_dir,
+        transform=get_train_augmentations(),
+    )
+    val_dataset = ACDCPreprocessed(
+        data_dir=val_split_dir,
+        transform=get_val_augmentations(),
+    )
+
+    # test_dataset = ACDCPreprocessed(
+    #     data_dir=test_split_dir,
+    #     transform=get_val_augmentations(),
+    # )
+
+    train_transforms_logged = serialize_transforms(getattr(train_dataset, 'transform', None))
+    test_transforms_logged = serialize_transforms(getattr(val_dataset, 'transform', None))
+
+
+    if accelerator.is_main_process:
+        print(f'Number of items in train_dataset: {len(train_dataset):,}')
+        print(f'Number of items in val_dataset: {len(val_dataset):,}')
+
+
+    train_dl = data.DataLoader(
+        train_dataset, args.batch_size, shuffle=True, prefetch_factor=2,
+        num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
+        pin_memory=True, generator=dl_gen, worker_init_fn=worker_init_fn
+    )
+
+    val_sampler = RandomSampler(val_dataset, replacement=False, generator=sampler_gen)
+    val_dl = data.DataLoader(
+        val_dataset, args.batch_size, shuffle=False,
+        num_workers=args.num_workers, persistent_workers=args.num_workers > 0, pin_memory=True,
+        sampler=val_sampler, generator=dl_gen, worker_init_fn=worker_init_fn
+    )
+
+    # Resolve overrides
+    save_every = args.save_every or train_config['save_every']
+    eval_every = args.evaluate_every or train_config['eval_every']
+    demo_every = args.demo_every or train_config.get('demo_every', eval_every)
+
+    # max epochs if provided will override end_step
+    if args.max_epochs is not None:
+        max_epochs = args.max_epochs
+        end_step = max_epochs * len(train_dl)
+    
+    else:
+        end_step = args.end_step or train_config['max_steps']
+        max_epochs = math.ceil(end_step / len(train_dl))
+
+    # Scheduler steps should follow optimizer updates, not micro-batches.
+    # Under gradient accumulation, Accelerate updates optimizer/scheduler
+    # roughly once every `grad_accum_steps` iterations.
+    sched_total_steps = max(1, math.ceil(end_step / args.grad_accum_steps))
+
     # LR scheduler
-    warmup_steps = int(end_step * sched_config['warmup'])
+    warmup_steps = int(sched_total_steps * sched_config['warmup'])
     if sched_config['type'] == 'constant':
         sched = ConstantLRWithWarmup(opt, warmup_steps=warmup_steps)
     elif sched_config['type'] == 'cosine':
         sched = LinearWarmupCosineAnnealingLR(
             opt,
             warmup_epochs=warmup_steps,
-            max_epochs=end_step,
-            warmup_start_lr=lr / 10,
+            max_epochs=sched_total_steps,
+            warmup_start_lr= lr / 10,
+            eta_min=1e-6,
         )
     else:
         raise ValueError(f'Invalid schedule type: {sched_config["type"]}')
+
+    ema_loss_stats = {}
 
     # Rectified flow
     flow = RectifiedFlow(
@@ -364,32 +634,7 @@ def main():
         time_sampling=flow_config.get('time_sampling', 'uniform'),
     )
 
-    # Dataset
-    train_dataset = ACDCPreprocessed(
-        data_dir=dataset_config['train_path'],
-        transform=get_train_augmentations(),
-    )
-    val_dataset = ACDCPreprocessed(
-        data_dir=dataset_config['test_path'],
-        transform=get_val_augmentations(),
-    )
-
-    if accelerator.is_main_process:
-        print(f'Number of items in train_dataset: {len(train_dataset):,}')
-        print(f'Number of items in val_dataset: {len(val_dataset):,}')
-
-    train_dl = data.DataLoader(
-        train_dataset, args.batch_size, shuffle=True,
-        num_workers=args.num_workers, persistent_workers=True, pin_memory=True, generator=demo_gen, worker_init_fn=worker_init_fn
-    )
-    val_sampler = RandomSampler(val_dataset, replacement=False, generator=demo_gen)
-    val_dl = data.DataLoader(
-        val_dataset, args.batch_size, shuffle=False,
-        num_workers=args.num_workers, persistent_workers=True, pin_memory=True, generator=demo_gen, worker_init_fn=worker_init_fn,
-        sampler=val_sampler,
-    )
-
-    inner_model, opt, train_dl, val_dl = accelerator.prepare(inner_model, opt, train_dl, val_dl)
+    inner_model, opt, train_dl, val_dl, sched = accelerator.prepare(inner_model, opt, train_dl, val_dl, sched)
 
     # EMA (must be after accelerator.prepare so shadow params are on the correct device)
     ema = ExponentialMovingAverage(unwrap(inner_model).parameters(), decay=ema_config['decay'])
@@ -397,18 +642,13 @@ def main():
     # Flop counting
     with torch.no_grad(), model_flops.flop_counter() as fc:
         t_dummy = torch.tensor([0.5], device=device)
-        model_type = model_config.get('type', 'image_transformer_v2')
-        if model_type == 'image_transformer_dualstream':
-            # Dual stream model: separate seg and cond_img inputs
-            in_channels_seg = model_config['output_channels']
-            in_channels_img = model_config['input_channels'] - model_config['output_channels']
-            x_seg = torch.zeros([1, in_channels_seg, size[0], size[1]], device=device)
-            cond_img = torch.zeros([1, in_channels_img, size[0], size[1]], device=device)
-            inner_model(x_seg, t_dummy, cond_img=cond_img)
-        else:
-            # Original model: concatenated input
-            x = torch.zeros([1, model_config['input_channels'], size[0], size[1]], device=device)
-            inner_model(x, t_dummy)
+
+        in_channels_seg = model_config['output_channels']
+        in_channels_img = model_config['input_channels'] - model_config['output_channels']
+        x_seg = torch.zeros([1, in_channels_seg, size[0], size[1]], device=device)
+        cond_img = torch.zeros([1, in_channels_img, size[0], size[1]], device=device)
+        inner_model(x_seg, t_dummy, cond_img=cond_img)
+
         if accelerator.is_main_process:
             print(f"Forward pass GFLOPs: {fc.flops / 1_000_000_000:,.3f}", flush=True)
 
@@ -416,9 +656,10 @@ def main():
     use_wandb = accelerator.is_main_process and args.wandb_project
     if use_wandb:
         import wandb
+        wandb.login(key="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")
         wandb.init(
             project=args.wandb_project,
-            name=f"hourglass-rectflow-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            name=f"rf-hourglass-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             save_code=True,
             config={
                 "batch_size": args.batch_size,
@@ -429,23 +670,30 @@ def main():
                 "len_train_dataset": len(train_dataset),
                 "len_val_dataset": len(val_dataset),
                 "checkpointing": args.checkpointing,
+                "max_epochs": max_epochs,
                 "end_step": end_step,
                 "parameters": model_param_count,
-                "dataset": "ACDC",
                 "lr_scheduler": sched_config['type'],
                 "lr_scheduler_warmup": sched_config.get('warmup', 0),
                 "flow_eps": flow_config['eps'],
                 "time_sampling": flow_config.get('time_sampling', 'uniform'),
                 "sample_steps": args.sample_steps,
+                "tta_enabled": args.tta,
+                "tta_mode": args.tta_mode,
                 "ema_decay": ema_config['decay'],
                 "dropout_rate": model_config['dropout_rate'],
                 "patch_size": model_config['patch_size'],
                 "depths": model_config['depths'],
                 "widths": model_config['widths'],
-                "use_expert_adaln": model_config.get('use_expert_adaln', False),
-                "time_sampling_method": flow_config.get('time_sampling', 'uniform'),
+                "use_early_stopping": args.use_early_stopping,
+                "early_stopping_patience": args.patience if args.use_early_stopping else None,
+                "early_stopping_delta": args.delta if args.use_early_stopping else None,
+                "train_transforms": train_transforms_logged,
+                "test_transforms": test_transforms_logged,
             },
         )
+        wandb.run.summary['train_transforms'] = json.dumps(train_transforms_logged, indent=2)
+        wandb.run.summary['test_transforms'] = json.dumps(test_transforms_logged, indent=2)
         wandb.watch(inner_model)
 
     # Segmentation info
@@ -454,7 +702,7 @@ def main():
     seg_class_names = ['RV', 'Myo', 'LV']
 
     # Checkpoint state
-    state_path = Path(f'states/{args.name}_state.json')
+    state_path = Path(f'states_acdc/{args.name}_state.json')
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
     if state_path.exists() or args.resume:
@@ -465,22 +713,22 @@ def main():
             ckpt_path = state['latest_checkpoint']
         if accelerator.is_main_process:
             print(f'Resuming from {ckpt_path}...')
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         unwrap(inner_model).load_state_dict(ckpt['model'])
         opt.load_state_dict(ckpt['opt'])
 
-        # override lr 
-        # for param_group in opt.param_groups:
-        #     param_group['lr'] = lr
-
         sched.load_state_dict(ckpt['sched'])
-
+        
         if 'ema' in ckpt:
             ema.load_state_dict(ckpt['ema'], device=device)
         ema_loss_stats = ckpt.get('ema_loss_stats', {})
         epoch = ckpt['epoch'] + 1
         step = ckpt['step'] + 1
-        demo_gen.set_state(ckpt['demo_gen'])
+        if 'sampler_gen' in ckpt:
+            sampler_gen.set_state(ckpt['sampler_gen'])
+            dl_gen.set_state(ckpt['dl_gen'])
+        elif 'demo_gen' in ckpt:
+            sampler_gen.set_state(ckpt['demo_gen'])
         elapsed = ckpt.get('elapsed', 0.0)
         del ckpt
     else:
@@ -488,46 +736,51 @@ def main():
         step = 0
 
     # Metrics logging
-    evaluate_enabled = eval_every > 0 and args.evaluate_n > 0
+    evaluate_enabled = eval_every > 0 and (args.evaluate_n is None or args.evaluate_n > 0)
     metrics_log = None
     if evaluate_enabled and accelerator.is_main_process:
-        Path('metrics').mkdir(exist_ok=True)
+        Path('metrics_acdc').mkdir(exist_ok=True)
         metrics_log = CSVLogger(
-            f'metrics/{args.name}_metrics.csv',
+            f'metrics_acdc/{args.name}_metrics.csv',
             ['step', 'time', 'loss', 'mean_dice'] + [f'dice_{name}' for name in seg_class_names],
         )
 
     # --- Helper functions ---
 
-    @torch.no_grad()
-    def sample_segmentation(cond_img, n_steps=None, use_ema=True):
-        """Sample segmentation from noise using Euler ODE solver.
-
-        Args:
-            cond_img: MRI conditioning images (B, 1, H, W).
-            n_steps: Number of Euler steps.
-            use_ema: Whether to use EMA model weights.
-
-        Returns:
-            Predicted segmentation (B, 3, H, W).
-        """
-        if n_steps is None:
-            n_steps = args.sample_steps
+    @contextmanager
+    def inference_model_scope(use_ema=True):
+        """Prepare model for inference and optionally swap in EMA weights once."""
         model_to_use = unwrap(inner_model)
-        shape = (cond_img.shape[0], n_seg_channels, size[0], size[1])
+        was_training = model_to_use.training
 
         if use_ema:
             ema.store(model_to_use.parameters())
             ema.copy_to(model_to_use.parameters())
 
         model_to_use.eval()
-        pred = euler_sample(model_to_use, cond_img, shape, device, N=n_steps, eps=flow.eps)
-        model_to_use.train()
+        try:
+            yield model_to_use
+        finally:
+            if use_ema:
+                ema.restore(model_to_use.parameters())
+            model_to_use.train(was_training)
 
-        if use_ema:
-            ema.restore(model_to_use.parameters())
+    @torch.no_grad()
+    def sample_segmentation(cond_img, model_to_use, n_steps=None, use_tta=False):
+        """Sample segmentation from noise using Euler ODE solver."""
+        if n_steps is None:
+            n_steps = args.sample_steps
+        shape = (cond_img.shape[0], n_seg_channels, size[0], size[1])
 
-        return pred
+        if use_tta:
+            preds = []
+            for forward_transform, inverse_transform, _ in get_tta_transforms(args.tta_mode):
+                cond_aug = forward_transform(cond_img)
+                pred_aug = euler_sample(model_to_use, cond_aug, shape, device, N=n_steps, eps=flow.eps)
+                preds.append(inverse_transform(pred_aug))
+            return torch.stack(preds, dim=0).mean(dim=0)
+
+        return euler_sample(model_to_use, cond_img, shape, device, N=n_steps, eps=flow.eps)
 
     def threshold_predictions(pred_seg):
         """Apply per-class thresholds to get binary predictions."""
@@ -544,6 +797,7 @@ def main():
     ]
     priority = [0, 1, 2]  # RV < Myo < LV (LV on top)
 
+
     @torch.no_grad()
     def demo(split='val'):
         """Generate demo visualization grid."""
@@ -551,8 +805,8 @@ def main():
         if accelerator.is_main_process:
             tqdm.write('Running segmentation demo...')
 
-        Path('demos').mkdir(exist_ok=True)
-        filename = f'demos/{args.name}_demo_{split}_{step:08}.png'
+        Path('demos_acdc').mkdir(exist_ok=True)
+        filename = f'demos_acdc/{args.name}_demo_{split}_{step:08}.png'
 
         if split == 'train':
             demo_batch = next(iter(train_dl))
@@ -561,12 +815,13 @@ def main():
 
         # ACDC returns (image, label) tuple
         cond_img_demo, label_demo = demo_batch
-        gt_seg_demo = convert_to_onehot(label_demo, num_classes=4)
+        gt_seg_demo = convert_to_onehot(label_demo, num_classes=num_classes)
         n_samples = min(args.sample_n, cond_img_demo.shape[0])
         cond_img_demo = cond_img_demo[:n_samples]
         gt_seg_demo = gt_seg_demo[:n_samples]
 
-        pred_seg = sample_segmentation(cond_img_demo)
+        with inference_model_scope(use_ema=True) as model_to_use:
+            pred_seg = sample_segmentation(cond_img_demo, model_to_use=model_to_use, use_tta=args.tta)
         pred_seg_binary = threshold_predictions(pred_seg)
 
         # Compute dice per class
@@ -631,136 +886,228 @@ def main():
                 wandb.log({'demo_grid': wandb.Image(filename), 'demo_mean_dice': mean_dice}, step=step)
 
     @torch.no_grad()
-    def evaluate(split='val', n_ensample=1):
-        """Evaluate segmentation quality using Dice score."""
-        if not evaluate_enabled:
-            return
-        if accelerator.is_main_process:
-            tqdm.write('Evaluating segmentation with Dice score...')
+    def evaluate(n_ensample=1, n_cases=None, split='val'):
+        """Evaluate per ACDC volume by stacking all slices per patient-phase.
 
-        rv_dice_scores = []
-        myo_dice_scores = []
-        lv_dice_scores = []
+        Each volume is identified from the filename prefix before `_sliceXX`
+        (for example `patient001_ED` and `patient001_ES`).
+        """
+        if not accelerator.is_main_process:
+            return None
 
-        rv_hd_scores = []
-        myo_hd_scores = []
-        lv_hd_scores = []
+        if split not in volume_index_by_split:
+            raise ValueError(f'Unknown split: {split}. Expected one of {list(volume_index_by_split.keys())}.')
 
-        n_evaluated = 0
+        volume_index = volume_index_by_split[split]
+        all_volume_ids = sorted(volume_index.keys())
 
-        eval_iter = iter(val_dl) if split == 'val' else iter(train_dl)
-        for eval_batch in tqdm(eval_iter, desc='Evaluating', disable=not accelerator.is_main_process):
-            if n_evaluated >= args.evaluate_n:
-                break
+        if len(all_volume_ids) == 0:
+            tqdm.write('No test cases found for volume-level evaluation.')
+            return None
 
-            # ACDC returns (image, label) tuple
-            cond_img_eval, label_eval = eval_batch
-            gt_seg_eval = convert_to_onehot(label_eval, num_classes=4)
-            batch_size_cur = cond_img_eval.shape[0]
+        selected_volume_ids = all_volume_ids if n_cases is None else all_volume_ids[:min(n_cases, len(all_volume_ids))]
+        tqdm.write(f'Evaluating volume-level metrics on {len(selected_volume_ids)} {split} volumes...')
 
-            # Ensemble predictions by sampling multiple times and averaging
-            pred_segs = []
-            for _ in range(n_ensample):
-                pred_seg = sample_segmentation(cond_img_eval)
-                pred_segs.append(pred_seg.cpu())
+        case_dice_scores = []
+        case_hd_scores = []
 
-            pred_seg = torch.stack(pred_segs, dim=0).mean(dim=0)
+        with inference_model_scope(use_ema=True) as model_to_use:
+            for volume_id in tqdm(selected_volume_ids, desc=f'Volume-level {split} eval'):
+                pred_slices = []
+                gt_slices = []
 
-            pred_seg_binary = threshold_predictions(pred_seg)
+                for _, npz_path in volume_index[volume_id]:
+                    data_npz = np.load(npz_path)
+                    image_np = data_npz['image']
+                    label_np = data_npz['label']
 
-            rv_dice_scores.append(dice(pred_seg_binary[:, 0:1], gt_seg_eval[:, 0:1]))
-            myo_dice_scores.append(dice(pred_seg_binary[:, 1:2], gt_seg_eval[:, 1:2]))
-            lv_dice_scores.append(dice(pred_seg_binary[:, 2:3], gt_seg_eval[:, 2:3]))
+                    cond_img_case = torch.from_numpy(image_np).unsqueeze(0).unsqueeze(0).float().to(device, non_blocking=True)
+                    gt_seg_case = torch.from_numpy(label_np).unsqueeze(0).unsqueeze(0).float()
+                    gt_seg_case = convert_to_onehot(gt_seg_case, num_classes=num_classes).cpu()
 
-            rv_hd_scores.append(hausdorff_distance_95(pred_seg_binary[:, 0:1].numpy(), gt_seg_eval[:, 0:1].numpy()))
-            myo_hd_scores.append(hausdorff_distance_95(pred_seg_binary[:, 1:2].numpy(), gt_seg_eval[:, 1:2].numpy()))
-            lv_hd_scores.append(hausdorff_distance_95(pred_seg_binary[:, 2:3].numpy(), gt_seg_eval[:, 2:3].numpy()))
+                    if n_ensample <= 1:
+                        pred_seg_case = sample_segmentation(cond_img_case, model_to_use=model_to_use, use_tta=args.tta)
+                    else:
+                        pred_ens = []
+                        for _ in range(n_ensample):
+                            pred_ens.append(sample_segmentation(cond_img_case, model_to_use=model_to_use, use_tta=args.tta))
+                        pred_seg_case = torch.stack(pred_ens).mean(dim=0)
 
-            n_evaluated += batch_size_cur
+                    pred_seg_binary_case = threshold_predictions(pred_seg_case).cpu()
 
-        mean_rv = torch.tensor(rv_dice_scores).nanmean().item()
-        mean_myo = torch.tensor(myo_dice_scores).nanmean().item()
-        mean_lv = torch.tensor(lv_dice_scores).nanmean().item()
+                    pred_slices.append(pred_seg_binary_case[0])
+                    gt_slices.append(gt_seg_case[0])
 
-        mean_dice = (mean_rv + mean_myo + mean_lv) / 3
-        mean_dice_per_class = [mean_rv, mean_myo, mean_lv]
+                pred_volume = torch.stack(pred_slices, dim=1).numpy()  # (C, D, H, W)
+                gt_volume = torch.stack(gt_slices, dim=1).numpy()      # (C, D, H, W)
 
-        mean_hd_rv = torch.tensor(rv_hd_scores).nanmean()
-        mean_hd_myo = torch.tensor(myo_hd_scores).nanmean()
-        mean_hd_lv = torch.tensor(lv_hd_scores).nanmean()
-
-        mean_hd = (mean_hd_rv + mean_hd_myo + mean_hd_lv) / 3
-        mean_hd_per_class = [mean_hd_rv, mean_hd_myo, mean_hd_lv]
-
-        if accelerator.is_main_process:
-            class_dice_str = ', '.join([
-                f'{seg_class_names[c]}: {mean_dice_per_class[c]:.4f}' for c in range(n_seg_channels)
-            ])
-
-            class_hd_str = ', '.join([
-                f'{seg_class_names[c]}: {mean_hd_per_class[c]:.4f}' for c in range(n_seg_channels)
-            ])
-
-            tqdm.write(f'{split} Eval Dice ({args.n_ensample} samples) - Mean: {mean_dice:.4f}, {class_dice_str}')
-            tqdm.write(f'{split} Eval HD95 ({args.n_ensample} samples) - Mean: {mean_hd:.4f}, {class_hd_str}')
-
-            if metrics_log is not None:
-                metrics_log.write(step, elapsed, ema_loss_stats.get('loss', 0), mean_dice,
-                                  *mean_dice_per_class)
-            if use_wandb:
-                import wandb
-                log_dict = {f'{split}_eval_mean_dice': mean_dice}
+                case_dice = []
+                case_hd = []
                 for c in range(n_seg_channels):
-                    log_dict[f'{split}_eval_dice_{seg_class_names[c]}'] = mean_dice_per_class[c]
-                wandb.log(log_dict, step=step)
+                    case_dice.append(dice(pred_volume[c], gt_volume[c]))
+                    case_hd.append(hausdorff_distance_95(pred_volume[c], gt_volume[c]))
 
+                case_dice_scores.append(case_dice)
+                case_hd_scores.append(case_hd)
+
+        case_dice_scores = np.asarray(case_dice_scores, dtype=np.float32)
+        case_hd_scores = np.asarray(case_hd_scores, dtype=np.float32)
+
+        mean_dice_per_class = np.nanmean(case_dice_scores, axis=0)
+        mean_hd_per_class = np.nanmean(case_hd_scores, axis=0)
+
+        mean_dice = float(np.nanmean(mean_dice_per_class))
+        mean_hd = float(np.nanmean(mean_hd_per_class))
+
+        class_dice_str = ', '.join([
+            f'{seg_class_names[c]}: {mean_dice_per_class[c]:.4f}' for c in range(n_seg_channels)
+        ])
+        class_hd_str = ', '.join([
+            f'{seg_class_names[c]}: {mean_hd_per_class[c]:.4f}' for c in range(n_seg_channels)
+        ])
+
+        tqdm.write(f'{split} Volume Eval Dice - Mean: {mean_dice:.4f}, {class_dice_str}')
+        tqdm.write(f'{split} Volume Eval HD95 - Mean: {mean_hd:.4f}, {class_hd_str}')
+
+        if use_wandb:
+            import wandb
+            log_dict = {
+                f'{split}_volume_eval_mean_dice': mean_dice,
+                f'{split}_volume_eval_mean_hd95': mean_hd,
+            }
+            for c in range(n_seg_channels):
+                log_dict[f'{split}_volume_eval_dice_{seg_class_names[c]}'] = float(mean_dice_per_class[c])
+                log_dict[f'{split}_volume_eval_hd95_{seg_class_names[c]}'] = float(mean_hd_per_class[c])
+            wandb.log(log_dict, step=step)
+
+        if metrics_log is not None:
+            metrics_log.write(step, elapsed, ema_loss_stats.get('loss', 0), mean_dice,
+                              *mean_dice_per_class)
+
+        return mean_dice
+    
     @torch.no_grad()
-    def find_best_thresholds(split='val'):
-        """Grid-search for best per-class thresholds."""
-        if accelerator.is_main_process:
-            tqdm.write('Finding best thresholds...')
+    def find_best_thresholds(split=None, n_ensample=1):
+        """Find best per-class thresholds from global Dice over all volumes.
 
-        all_probs = []
-        all_targets = []
-        n_evaluated = 0
+        Workflow:
+        1) Predict and cache all 3D volumes for all cases in the split.
+        2) Grid-search thresholds per class using all cases together (global).
 
-        eval_iter = iter(val_dl) if split == 'val' else iter(train_dl)
-        for eval_batch in tqdm(eval_iter, desc='Sampling for threshold search', disable=not accelerator.is_main_process):
-            if n_evaluated >= args.evaluate_n:
-                break
-            # ACDC returns (image, label) tuple
-            cond_img_eval, label_eval = eval_batch
-            pred_seg = sample_segmentation(cond_img_eval)
-            all_probs.append(pred_seg.cpu())
-            all_targets.append(convert_to_onehot(label_eval, num_classes=4).cpu())
-            n_evaluated += cond_img_eval.shape[0]
+        Supported splits: `val`, `test`, or `None` (run both).
+        """
+        if not accelerator.is_main_process:
+            return None
 
-        all_probs = torch.cat(all_probs, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
+        valid_splits = ('val', 'test')
+        if split is None:
+            splits_to_run = list(valid_splits)
+        elif isinstance(split, str):
+            if split not in valid_splits:
+                raise ValueError(f'Unsupported split for threshold search: {split}. Expected one of {valid_splits}.')
+            splits_to_run = [split]
+        else:
+            raise ValueError(f'Invalid split argument type: {type(split)}. Expected str or None.')
 
-        thresholds = torch.linspace(-0.1, 0.8, 100)
-        C = all_probs.shape[1]
-        best_t = torch.zeros(C)
-        best_dice = torch.zeros(C)
+        # RF outputs are not constrained logits/probabilities, so keep a broad search range.
+        thresholds = np.linspace(args.thresh_start, args.thresh_end, 100, dtype=np.float32)
+        n_thresholds = len(thresholds)
+        results = {}
 
-        for c in range(C):
-            target_c = all_targets[:, c].float()
-            for t in tqdm(thresholds, desc=f'Class {c}', disable=not accelerator.is_main_process):
-                pred_c = (all_probs[:, c] > t).float()
-                d = dice(pred_c, target_c)
-                if d > best_dice[c]:
-                    best_dice[c] = d
-                    best_t[c] = t
+        with inference_model_scope(use_ema=True) as model_to_use:
+            for split_name in splits_to_run:
+                volume_index = volume_index_by_split[split_name]
+                all_volume_ids = sorted(volume_index.keys())
 
-        if accelerator.is_main_process:
-            tqdm.write(f'Best thresholds: {best_t.tolist()}, dice: {best_dice.tolist()}')
-        return best_t, best_dice
+                if len(all_volume_ids) == 0:
+                    tqdm.write(f'No cases found in split={split_name} for threshold search.')
+                    results[split_name] = None
+                    continue
 
-    def save():
+                selected_volume_ids = all_volume_ids
+                tqdm.write(
+                    f'Finding best thresholds on {len(selected_volume_ids)} {split_name} cases '
+                    '(volume-level)...'
+                )
+
+                # Stage 1: predict all 3D volumes and cache them.
+                cached_cases = []
+
+                for volume_id in tqdm(selected_volume_ids, desc=f'Threshold search {split_name}'):
+                    prob_slices = []
+                    gt_slices = []
+
+                    for _, npz_path in volume_index[volume_id]:
+                        data_npz = np.load(npz_path)
+                        image_np = data_npz['image']
+                        label_np = data_npz['label']
+
+                        cond_img_case = torch.from_numpy(image_np).unsqueeze(0).unsqueeze(0).float().to(
+                            device, non_blocking=True
+                        )
+                        gt_seg_case = torch.from_numpy(label_np).unsqueeze(0).unsqueeze(0).float()
+                        gt_seg_case = convert_to_onehot(gt_seg_case, num_classes=num_classes).cpu()
+
+                        if n_ensample <= 1:
+                            pred_seg_case = sample_segmentation(cond_img_case, model_to_use=model_to_use, use_tta=args.tta)
+                        else:
+                            pred_ens = []
+                            for _ in range(n_ensample):
+                                pred_ens.append(sample_segmentation(cond_img_case, model_to_use=model_to_use, use_tta=args.tta))
+                            pred_seg_case = torch.stack(pred_ens).mean(dim=0)
+
+                        prob_slices.append(pred_seg_case[0].cpu())
+                        gt_slices.append(gt_seg_case[0])
+
+                    prob_volume = torch.stack(prob_slices, dim=1).numpy()  # (C, D, H, W)
+
+                    gt_volume = torch.stack(gt_slices, dim=1).numpy()      # (C, D, H, W)
+
+                    cached_cases.append((prob_volume.astype(np.float16), gt_volume.astype(np.uint8)))
+
+                # Stage 2: threshold search on all cases using mean per-case Dice.
+                mean_case_dice_grid = np.full((n_seg_channels, n_thresholds), np.nan, dtype=np.float32)
+
+                for c in range(n_seg_channels):
+                    for t_idx, t in enumerate(thresholds):
+                        case_dices = []
+                        for prob_volume, gt_volume in cached_cases:
+                            pred_c = (prob_volume[c] > t).astype(np.float32)
+                            target_c = gt_volume[c].astype(np.float32)
+                            d = dice(pred_c, target_c)
+                            if not np.isnan(d):
+                                case_dices.append(float(d))
+
+                        if len(case_dices) > 0:
+                            mean_case_dice_grid[c, t_idx] = float(np.mean(case_dices))
+
+                best_t = torch.zeros(n_seg_channels)
+                best_dice = torch.zeros(n_seg_channels)
+                for c in range(n_seg_channels):
+                    if np.all(np.isnan(mean_case_dice_grid[c])):
+                        continue
+                    best_idx = int(np.nanargmax(mean_case_dice_grid[c]))
+                    best_t[c] = float(thresholds[best_idx])
+                    best_dice[c] = float(mean_case_dice_grid[c, best_idx])
+
+                tqdm.write(
+                    f'Best thresholds ({split_name}): {best_t.tolist()}, '
+                    f'mean case dice: {best_dice.tolist()}'
+                )
+                results[split_name] = (best_t, best_dice)
+
+        if len(splits_to_run) == 1:
+            return results[splits_to_run[0]]
+        return results
+
+    def save(save_path=None):
         """Save checkpoint."""
         accelerator.wait_for_everyone()
-        Path('checkpoints').mkdir(exist_ok=True)
-        filename = f'checkpoints/{args.name}_{step:08}.pth'
+        Path('checkpoints_acdc').mkdir(exist_ok=True)
+        if save_path is None:
+            filename = f'checkpoints_acdc/{args.name}_{step:08}.pth'
+        else:
+            filename = save_path
         if accelerator.is_main_process:
             tqdm.write(f'Saving to {filename}...')
         obj = {
@@ -772,7 +1119,8 @@ def main():
             'ema_loss_stats': ema_loss_stats,
             'epoch': epoch,
             'step': step,
-            'demo_gen': demo_gen.get_state(),
+            'sampler_gen': sampler_gen.get_state(),
+            'dl_gen': dl_gen.get_state(),
             'elapsed': elapsed,
         }
         accelerator.save(obj, filename)
@@ -780,13 +1128,33 @@ def main():
             state_obj = {'latest_checkpoint': filename}
             json.dump(state_obj, open(state_path, 'w'))
 
+
+    if args.find_best_thresh:
+        find_best_thresholds(split=args.eval_split, n_ensample=args.n_ensample)
+        return
+
     # --- Evaluate only mode ---
     if args.evaluate_only:
-        evaluate('val', n_ensample = args.n_ensample)
+        evaluate(split=args.eval_split, n_ensample=args.n_ensample, n_cases=args.evaluate_n)
         return
+
+    # --- Early stopping setup ---
+    early_stopper = None
+    if args.use_early_stopping:
+        early_stopper = EarlyStopping(
+            patience=args.patience,
+            verbose=accelerator.is_main_process,
+            delta=args.delta,
+            save_path=f'checkpoints_acdc/{args.name}_best.pth',
+        )
+        if accelerator.is_main_process:
+            print(f'Early stopping enabled: patience={args.patience}, delta={args.delta}')
 
     # --- Training loop ---
     losses_since_last_print = []
+
+    print(f'==== Starting training for up to {max_epochs} epochs ( {end_step} steps) ====')
+
 
     try:
         while True:
@@ -801,9 +1169,8 @@ def main():
                     start_timer = time.time()
 
                 with accelerator.accumulate(inner_model):
-                    # ACDC returns (image, label) tuple
                     cond_img, label = batch
-                    x_1 = convert_to_onehot(label, num_classes=4)  # (B, 3, H, W)
+                    x_1 = convert_to_onehot(label, num_classes=num_classes)
 
                     with checkpointing_ctx(args.checkpointing):
                         loss = flow.loss(inner_model, x_1, cond_img)
@@ -857,9 +1224,22 @@ def main():
                     demo("val")
 
                 if evaluate_enabled and step > 0 and step % eval_every == 0:
-                    evaluate("val")
+                    val_dice = None
+                    val_dice_dict = evaluate(split=args.eval_split, n_ensample=args.n_ensample, n_cases=args.evaluate_n)
+                    if val_dice_dict is not None:
+                        val_dice = val_dice_dict if isinstance(val_dice_dict, float) else val_dice_dict['mean_dice']
 
-                if step > 0 and step % save_every == 0:
+                    # Early stopping check
+                    if args.use_early_stopping and val_dice is not None:
+                        early_stopper(val_dice, save)
+                        if early_stopper.early_stop:
+                            if accelerator.is_main_process:
+                                tqdm.write(f'Early stopping at step {step}. Best dice: {early_stopper.best_score:.4f}')
+                            save()  # Save last checkpoint
+                            return
+
+                # Save based on steps only if early stopping is disabled
+                if not args.use_early_stopping and step > 0 and step % save_every == 0:
                     save()
 
                 if step >= end_step:

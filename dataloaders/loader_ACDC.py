@@ -19,26 +19,49 @@ def get_train_augmentations():
     """Runtime augmentations for training (random transforms only)."""
     return transforms.Compose(
         [
-            transforms.RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-            transforms.RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-            transforms.RandRotate90d(keys=["image", "label"], prob=0.5, spatial_axes=(0, 1)),
+            # transforms.RandRotated(
+            #     keys=["image", "label"],
+            #     range_x=0.26,   # ±15 degrees in radians
+            #     prob=0.5,
+            #     mode=("bilinear", "nearest"),
+            #     padding_mode="zeros",
+            #     keep_size=True
+            # ),
+            transforms.RandFlipd(keys =["image", "label"], prob=0.5, spatial_axis=0),
+            transforms.RandFlipd(keys =["image", "label"], prob=0.5, spatial_axis=1),
+            # transforms.RandZoomd(
+            #     keys=["image", "label"],
+            #     prob=0.3,
+            #     min_zoom=0.9,
+            #     max_zoom=1.1,
+            #     mode=("bilinear", "nearest"),
+            #     keep_size=True
+            # ),
+
             transforms.RandAffined(
                 keys=["image", "label"],
                 prob=0.5,
-                rotate_range=(0.1745,),  # ~10 degrees
-                scale_range=(0.1, 0.1),
+                rotate_range=(0.26,),   # ~15degrees
+                scale_range=(0.1,),
                 translate_range=(10, 10),
                 mode=("bilinear", "nearest"),
                 padding_mode="zeros",
+
             ),
-            transforms.RandGaussianNoised(keys=["image"], prob=0.5, std=0.05),
-            transforms.RandAdjustContrastd(keys=["image"], prob=0.3, gamma=(0.7, 1.5)),
-            transforms.RandGaussianSmoothd(
-                keys=["image"],
-                prob=0.2,
-                sigma_x=(0.5, 1.0),
-                sigma_y=(0.5, 1.0),
+            transforms.Rand2DElasticd(
+                keys=["image", "label"],
+                prob=0.3,
+                spacing=(20, 20),
+                magnitude_range=(1, 3),
+                mode=("bilinear", "nearest"),
+                padding_mode="zeros"
             ),
+
+            transforms.RandScaleIntensityd(keys =["image"], factors=0.1, prob=0.5), # 0.8 -> 0.5
+            transforms.RandShiftIntensityd(keys =["image"], offsets=0.1, prob=0.5), # 0.8 -> 0.5
+            transforms.RandGaussianNoised(keys=["image"], prob=0.3, std=0.08, sample_std=True), # prob 0.5 -> 0.3, std 0.10 -> 0.8
+            transforms.RandAdjustContrastd(keys=["image"], prob=0.3, gamma=(0.7, 1.4)), # increased prob from 0.2 to 0.3| (0.65, 1.5) ->(0.7, 1.4)
+            
             transforms.EnsureTyped(keys=["image", "label"], dtype=torch.float32),
         ]
     )

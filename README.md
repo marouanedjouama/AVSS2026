@@ -9,6 +9,23 @@ install natten for neighborhood attention
 pip install natten==0.21.5+torch290cu128 -f https://whl.natten.org
 ```
 
+### ACDC
+download the dataset
+``` bash
+./scripts/prepare_brats2021.sh
+```
+
+preprocess the dataset
+``` bash
+python ./utils/preprocess_acdc.py
+```
+
+run training on the ACDC dataset
+
+``` bash
+python train_acdc.py --config configs/config_acdc_v3_noLerp.json --name Run_100_noLerp --batch-size 32 --grad-accum-steps 1 --max-epochs 1000 --wandb-project AVSS2026-acdc --sample-steps 1 --evaluate-every 20000 --demo-every 20000 --save-every 5000 --compile --num-workers 16
+```
+
 ### brats 2020
 download the dataset
 ``` bash

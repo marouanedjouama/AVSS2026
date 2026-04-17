@@ -6,6 +6,7 @@ This script takes only the training data, splits it at the patient level
 into train/val/test sets (0.7/0.1/0.2), then preprocesses and saves each split.
 
 Usage:
+    python preprocess_acdc.py
     python preprocess_acdc.py --data_dir /path/to/ACDC/database --output /path/to/output
     python preprocess_acdc.py --data_dir /path/to/ACDC/database --seed 42
 """
@@ -41,12 +42,12 @@ def get_preprocessing_transform():
             ),
             transforms.SpatialPadd(
                 keys=["image", "label"],
-                spatial_size=(256, 256, -1),
+                spatial_size=(224, 224, -1),
                 mode="constant",
             ),
             transforms.CenterSpatialCropd(
                 keys=["image", "label"],
-                roi_size=(256, 256, -1),
+                roi_size=(224, 224, -1),
             ),
             transforms.NormalizeIntensityd(keys="image"),
         ]
@@ -184,14 +185,20 @@ def preprocess_split(data_dir, cases, output_dir, split_name, transform):
 
 
 def main():
+    project_root = Path(__file__).resolve().parents[1]
+    default_data_dir = project_root / "data" / "ACDC" / "database"
+
     parser = argparse.ArgumentParser(
         description="Preprocess ACDC dataset with patient-level split"
     )
     parser.add_argument(
         "--data_dir",
         type=str,
-        required=True,
-        help="Path to ACDC database directory (containing 'training_' folder after reorganization)",
+        default=str(default_data_dir),
+        help=(
+            "Path to ACDC database directory (containing 'training_' folder after reorganization). "
+            f"Default: {default_data_dir}"
+        ),
     )
     parser.add_argument(
         "--output",
