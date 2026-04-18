@@ -12,7 +12,7 @@ pip install natten==0.21.5+torch290cu128 -f https://whl.natten.org
 ### ACDC
 download the dataset
 ``` bash
-./scripts/prepare_brats2021.sh
+./scripts/download_acdc.sh
 ```
 
 preprocess the dataset
