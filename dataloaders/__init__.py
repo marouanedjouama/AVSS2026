@@ -1,6 +1,5 @@
-from .bratsDataset_v2 import BraTSDataset2D
-from .isic2018Dataset import ISIC2018Dataset
+from .bratsDataset21 import BraTSDataset21
 from .loader_ACDC import ACDCPreprocessed
 
 
-__all__ = ['BraTSDataset2D', 'ISIC2018Dataset', 'ACDCPreprocessed']
+__all__ = ['BraTSDataset21', 'ACDCPreprocessed']

@@ -10,14 +10,9 @@ pip install natten==0.21.5+torch290cu128 -f https://whl.natten.org
 ```
 
 ### ACDC
-download the dataset
+download & preprocess the dataset
 ``` bash
 ./scripts/download_acdc.sh
-```
-
-preprocess the dataset
-``` bash
-python ./utils/preprocess_acdc.py
 ```
 
 run training on the ACDC dataset

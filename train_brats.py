@@ -36,12 +36,11 @@ from torchvision import utils as tv_utils
 from tqdm.auto import tqdm
 from torch.utils.data import RandomSampler, WeightedRandomSampler
 
-from dataloaders.bratsDataset_v2 import BraTSDataset2D
 from dataloaders.bratsDataset21 import BraTSDataset21
 
 from ema import ExponentialMovingAverage
 
-from hourglass.image_transformer_v2 import (
+from hourglass.image_transformer_base import (
     ImageTransformerDenoiserModelV2,
     LevelSpec,
     MappingSpec,
@@ -55,7 +54,7 @@ from lr_scheduler import ConstantLRWithWarmup, LinearWarmupCosineAnnealingLR
 from utils.metric import dice, hausdorff_distance_95
 from rectified_flow import RectifiedFlow
 from sampling import euler_sample, rk45_sample
-from hourglass.image_transformer_v3 import ImageTransformerDenoiserModelV3
+from hourglass.image_transformer_main import ImageTransformerDenoiserModelV3
 
 
 CLASS_DICE_THRESH = [0.5, 0.5, 0.5]
@@ -492,12 +491,10 @@ def main():
     print(f'Train cases: {len(case_dirs_train)}, Val cases: {len(case_dirs_val)}, Test cases: {len(case_dirs_test)}')
 
 
-    if args.brats == '2020':
-        dataset_class = BraTSDataset2D
-    elif args.brats == '2021':
+    if args.brats == '2021':
         dataset_class = BraTSDataset21
     else: 
-        raise ValueError(f"Invalid BraTS version specified: {args.brats}. Must be '2020' or '2021'.")
+        raise ValueError(f"Invalid BraTS version specified: {args.brats}. Must be '2021'.")
 
     train_dataset = dataset_class(
         case_paths=case_dirs_train,

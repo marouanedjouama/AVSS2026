@@ -1,16 +1,13 @@
-"""k-diffusion transformer diffusion models, version 3.
-
-This variant keeps the original main hourglass path over concatenated
-segmentation/image inputs, and adds a separate conditioning-image encoder.
-The conditioning features are fused into the main encoder with learnable
-linear interpolation at each encoder scale before the main bottleneck.
+"""
+in this variant the conditioning features are fused into the main encoder with simple
+addition at each encoder scale rather than lerp.
 """
 
 import torch
 from torch import nn
 
 from .axial_rope import make_axial_pos
-from .image_transformer_v2 import (
+from .image_transformer_base import (
     FourierFeatures,
     GlobalAttentionSpec,
     GlobalTransformerLayer,
@@ -32,18 +29,7 @@ from .image_transformer_v2 import (
 )
 
 
-class LerpFeatureFuse(nn.Module):
-    """Learnable interpolation fuse: lerp(main, cond_feat, alpha)."""
-
-    def __init__(self, init=0.5):
-        super().__init__()
-        self.fac = nn.Parameter(torch.ones(1) * init)
-
-    def forward(self, main, cond_feat):
-        return torch.lerp(main, cond_feat, self.fac.to(main.dtype))
-
-
-class ImageConditionEncoderV3(nn.Module):
+class ImageConditionEncoderV4(nn.Module):
     """Conditioning encoder branch with L-1 levels (no bottleneck)."""
 
     def __init__(self, levels, mapping_width, patch_size, cond_in_channels):
@@ -96,8 +82,8 @@ class ImageConditionEncoderV3(nn.Module):
         return level_features
 
 
-class ImageTransformerDenoiserModelV3(nn.Module):
-    """V3 hourglass denoiser with separate conditioning-image encoder fusion."""
+class ImageTransformerDenoiserModelV3_noLerp(nn.Module):
+    """V4 hourglass denoiser with additive conditioning-image encoder fusion."""
 
     def __init__(
         self,
@@ -164,13 +150,12 @@ class ImageTransformerDenoiserModelV3(nn.Module):
             [TokenSplit(spec_2.width, spec_1.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])]
         )
 
-        self.cond_encoder = ImageConditionEncoderV3(
+        self.cond_encoder = ImageConditionEncoderV4(
             levels=levels,
             mapping_width=mapping.width,
             patch_size=patch_size,
             cond_in_channels=self.cond_in_channels,
         )
-        self.encoder_fuses = nn.ModuleList([LerpFeatureFuse() for _ in range(len(levels) - 1)])
 
         self.out_norm = RMSNorm(levels[0].width)
         self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
@@ -191,7 +176,7 @@ class ImageTransformerDenoiserModelV3(nn.Module):
 
     def forward(self, x, t, cond_img=None):
         if cond_img is None:
-            raise ValueError("cond_img is required for ImageTransformerDenoiserModelV3")
+            raise ValueError("cond_img is required for ImageTransformerDenoiserModelV3_noLerp")
         if cond_img.shape[1] != self.cond_in_channels:
             raise ValueError(
                 f"cond_img has {cond_img.shape[1]} channels, expected {self.cond_in_channels}"
@@ -213,16 +198,15 @@ class ImageTransformerDenoiserModelV3(nn.Module):
 
         cond_features = self.cond_encoder(cond_img, pos)
 
-        # Hourglass encoder with scale-wise fusion from condition encoder.
+        # Hourglass encoder with scale-wise additive fusion from condition encoder.
         skips, poses = [], []
-        for down_level, merge, cond_feat, fuse in zip(
+        for down_level, merge, cond_feat in zip(
             self.down_levels,
             self.merges,
             cond_features,
-            self.encoder_fuses,
         ):
             x = down_level(x, pos, cond)
-            x = fuse(x, cond_feat)
+            x = x + cond_feat
             skips.append(x)
             poses.append(pos)
             x = merge(x)
@@ -245,5 +229,5 @@ __all__ = [
     "NeighborhoodAttentionSpec",
     "LevelSpec",
     "MappingSpec",
-    "ImageTransformerDenoiserModelV3",
+    "ImageTransformerDenoiserModelV3_noLerp",
 ]

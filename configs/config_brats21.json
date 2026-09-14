@@ -1,6 +1,6 @@
 {
     "model": {
-        "type": "image_transformer_v2",
+        "type": "image_transformer_main",
         "input_channels": 7,
         "output_channels": 3,
         "input_size": [192, 192],

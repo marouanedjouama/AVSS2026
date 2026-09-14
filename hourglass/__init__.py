@@ -1,6 +1,6 @@
 from . import flops
 from .flags import checkpointing, get_checkpointing
-from .image_transformer_v2 import ImageTransformerDenoiserModelV2
-from .image_transformer_v3 import ImageTransformerDenoiserModelV3
-from .image_transformer_v3_noLerp import ImageTransformerDenoiserModelV3_noLerp
+from .image_transformer_base import ImageTransformerDenoiserModelV2
+from .image_transformer_main import ImageTransformerDenoiserModelV3
+from .image_transformer_noLerp import ImageTransformerDenoiserModelV3_noLerp
 

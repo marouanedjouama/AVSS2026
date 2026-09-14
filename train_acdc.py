@@ -4,14 +4,8 @@
 using Hourglass Transformer + Rectified Flow.
 """
 
-# python train_brats.py --config configs/config_mmDiT_brats20.json --brats 2020 --name Run_1 --batch-size 16 --grad-accum-steps 2 --max-epochs 300 --wandb-project AVSS2026-brats2020 
-# --sample-steps 5 --evaluate-n 5 --evaluate-every 1000 --demo-every 1000 --save-every 5000 --compile --checkpointing
-
 # TODO when resuming training, it start from the beginning of the dataloader and drops the rest of the current epoch. 
-# It would be better to save the dataloader state and resume from the exact same point.
-
-# TODO remove your wandb key later
-
+# It would be better to save the dataloaders state and resume from the exact same point.
 
 import argparse
 from contextlib import contextmanager
@@ -38,15 +32,15 @@ from torch.utils.data import RandomSampler
 
 from ema import ExponentialMovingAverage
 
-from hourglass.image_transformer_v2 import (
+from hourglass.image_transformer_base import (
     ImageTransformerDenoiserModelV2,
     LevelSpec,
     MappingSpec,
     GlobalAttentionSpec,
     NeighborhoodAttentionSpec,
 )
-from hourglass.image_transformer_v3 import ImageTransformerDenoiserModelV3
-from hourglass.image_transformer_v3_noLerp import ImageTransformerDenoiserModelV3_noLerp
+from hourglass.image_transformer_main import ImageTransformerDenoiserModelV3
+from hourglass.image_transformer_noLerp import ImageTransformerDenoiserModelV3_noLerp
                                                 
 from hourglass.flags import checkpointing as checkpointing_ctx
 from hourglass import flops as model_flops
@@ -57,9 +51,7 @@ from sampling import euler_sample
 from dataloaders.loader_ACDC import ACDCPreprocessed, get_train_augmentations, get_val_augmentations
 
 
-# CLASS_DICE_THRESH = [0.5, 0.5, 0.5]
-CLASS_DICE_THRESH = [0.5050, 0.411, 0.5016] # better than [0.5] * 3
-
+CLASS_DICE_THRESH = [0.5, 0.5, 0.5]
 
 def worker_init_fn(worker_id):
     """Initialize worker with unique seed for reproducibility."""
@@ -195,14 +187,12 @@ def make_model(config):
         out_channels=model_config['output_channels'],
         patch_size=tuple(model_config['patch_size']),
     )
-    if model_type_norm == 'image_transformer_v2':
+    if model_type_norm == 'image_transformer_base':
         model = ImageTransformerDenoiserModelV2(**model_kwargs)
-    elif model_type_norm == 'image_transformer_v3':
+    elif model_type_norm == 'image_transformer_main':
         model = ImageTransformerDenoiserModelV3(**model_kwargs)
     elif model_type_norm in (
-        'image_transformer_v3_nolerp',
-        'image_transformer_v3_no_lerp',
-        'imagetransformerdenoisermodelv3_nolerp',
+        'image_transformer_noLerp',
     ):
         model = ImageTransformerDenoiserModelV3_noLerp(**model_kwargs)
     else:
@@ -606,9 +596,6 @@ def main():
         end_step = args.end_step or train_config['max_steps']
         max_epochs = math.ceil(end_step / len(train_dl))
 
-    # Scheduler steps should follow optimizer updates, not micro-batches.
-    # Under gradient accumulation, Accelerate updates optimizer/scheduler
-    # roughly once every `grad_accum_steps` iterations.
     sched_total_steps = max(1, math.ceil(end_step / args.grad_accum_steps))
 
     # LR scheduler
@@ -636,7 +623,6 @@ def main():
 
     inner_model, opt, train_dl, val_dl, sched = accelerator.prepare(inner_model, opt, train_dl, val_dl, sched)
 
-    # EMA (must be after accelerator.prepare so shadow params are on the correct device)
     ema = ExponentialMovingAverage(unwrap(inner_model).parameters(), decay=ema_config['decay'])
 
     # Flop counting
@@ -655,8 +641,8 @@ def main():
     # WandB
     use_wandb = accelerator.is_main_process and args.wandb_project
     if use_wandb:
-        import wandb
-        wandb.login(key="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")
+        import wandbs
+        wandb.login(key="put_your_wandb_api_key_here")  # Replace with your actual WandB API key
         wandb.init(
             project=args.wandb_project,
             name=f"rf-hourglass-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -696,7 +682,6 @@ def main():
         wandb.run.summary['test_transforms'] = json.dumps(test_transforms_logged, indent=2)
         wandb.watch(inner_model)
 
-    # Segmentation info
     n_img_channels = 1  # ACDC has single-channel cardiac MRI
     n_seg_channels = 3  # RV, Myo, LV (excluding background)
     seg_class_names = ['RV', 'Myo', 'LV']
